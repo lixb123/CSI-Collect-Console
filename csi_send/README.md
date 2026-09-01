@@ -21,16 +21,16 @@
 在 ESP-IDF 5.5.5 终端中运行：
 
 ```powershell
-cd F:\ESP_project\esp-csi\console-csi-v6\csi_send
+cd CSI-Collect-Console\csi_send
 idf.py -B build-research-s3 set-target esp32s3
 idf.py -B build-research-s3 build
 idf.py -B build-research-s3 -p COM端口 flash monitor
 ```
 
-本次验证生成的应用固件位于：
+构建生成的应用固件位于：
 
 ```text
-F:\ESP_project\esp-csi\console-csi-v6\csi_send\build-research-s3\csi_send.bin
+csi_send/build-research-s3/csi_send.bin
 ```
 
 ## 串口配置
