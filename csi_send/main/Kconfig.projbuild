@@ -1,0 +1,29 @@
+menu "Research CSI transmitter"
+
+config RESEARCH_TX_EXPERIMENT_ID
+    string "Default experiment ID"
+    default "UNSET"
+    help
+        Compact pseudonymous experiment/session identifier. Runtime changes are
+        available through the research_tx console command.
+
+config RESEARCH_TX_SEND_INTERVAL_MS
+    int "Default send interval (ms)"
+    range 1 60000
+    default 10
+
+config RESEARCH_TX_PAYLOAD_LENGTH
+    int "Research application payload length (bytes)"
+    range 0 186
+    default 32
+
+config RESEARCH_TX_CHANNEL
+    int "2.4 GHz Wi-Fi channel"
+    range 1 13
+    default 11
+
+config RESEARCH_TX_AUTOSTART
+    bool "Start transmitting automatically after boot"
+    default y
+
+endmenu

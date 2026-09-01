@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf: ">=4.4.1"
+
+  esp-radar: ">=0.3.0"
+
+  espressif/led_strip: "^2.5.3"

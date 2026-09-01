@@ -1,0 +1,15 @@
+{
+  "router_ssid": "",
+  "router_password": "",
+  "router_auto_connect": false,
+  "display_raw_data": true,
+  "display_radar_model": true,
+  "display_eigenvalues_table": false,
+  "participant_id": "P001",
+  "room_id": "R01",
+  "language": "zh",
+  "collect_action": "none",
+  "collect_wait_seconds": 3,
+  "collect_duration_seconds": 3,
+  "collect_number": 1
+}

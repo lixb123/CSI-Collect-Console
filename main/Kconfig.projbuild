@@ -1,0 +1,11 @@
+menu "Research CSI receiver"
+
+config RESEARCH_RX_ESPNOW_MODE
+    bool "Use the external research ESP-NOW transmitter"
+    default y
+    help
+        Keep the CSI source-MAC filter on 1a:00:00:00:00:00 and do not start
+        the receiver's legacy router-ping/null-data traffic generator. Disable
+        this option to retain the legacy router-triggered CSI workflow.
+
+endmenu

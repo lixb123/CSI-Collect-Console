@@ -1,0 +1,33 @@
+# ESP-IDF and CMake build output
+build*/
+csi_send/build*/
+managed_components/
+sdkconfig
+sdkconfig.old
+csi_send/sdkconfig
+csi_send/sdkconfig.old
+
+# Local editor and Python files
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Personal configuration: may contain a Wi-Fi password
+tools/config/gui_config.json
+tools/config/experiment_config.json
+
+# Runtime data and logs. Keep the data documentation tracked.
+tools/data/*
+!tools/data/README.md
+tools/log/
+
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+
