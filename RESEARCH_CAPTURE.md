@@ -110,13 +110,12 @@ For cross-person, cross-session, and cross-room AI claims:
 
 For ISAC/ISCC sweeps, change one controlled factor at a time and create a new session/config for each condition. Useful factors include send interval, channel, 20/40 MHz bandwidth, MCS/rate, CSI LTF type, distance, orientation, obstruction, interference load, and compute placement.
 
-## Still recommended for a later firmware revision
+## Implemented and still recommended
 
-- transmitter-side packet sequence and transmit timestamp embedded in payload;
-- ESP-NOW send callback success/failure and retry counters;
-- received byte and packet counters for application goodput;
+- Implemented: transmitter packet sequence, monotonic transmit timestamp, experiment ID/hash, payload length, CRC, callback success/failure counters, and receiver packet/byte/gap counters.
+- Still recommended: explicit retry counters if the selected MAC API exposes a reliable retry definition;
 - synchronized clocks or ping-pong timestamps for end-to-end latency;
 - INA219/INA226 or similar power-monitor samples aligned to recording IDs;
 - inference/preprocessing timing and model memory if inference moves onto the ESP32.
 
-Those fields require changes to both sender and receiver protocol or extra hardware. They should not be estimated from current CSI timestamps.
+The remaining measurements require protocol extensions or extra hardware. They should not be estimated from current CSI timestamps.
