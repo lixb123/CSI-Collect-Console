@@ -11,5 +11,7 @@
   "collect_action": "none",
   "collect_wait_seconds": 3,
   "collect_duration_seconds": 3,
-  "collect_number": 1
+  "collect_number": 1,
+  "complex_csi_enabled": true,
+  "calibration_role": "activity"
 }

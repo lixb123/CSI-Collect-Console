@@ -5,7 +5,7 @@
   "date": "2026-09-01",
   "room_id": "R01",
   "receiver_id": "ESP32-RX-01",
-  "sender_id": "ESP32-TX-01",
+  "sender_id": "",
   "router_id": "AP-01",
   "router_position": {"x_m": 0.0, "y_m": 0.0, "z_m": 1.2},
   "receiver_position": {"x_m": 3.0, "y_m": 0.0, "z_m": 1.2},
@@ -15,11 +15,17 @@
   "scenario": "furnished_room",
   "occupancy": 1,
   "interference_condition": "normal",
-  "send_mode": "espnow_research",
+  "send_mode": "router_ping",
   "send_interval_ms": 10,
   "csi_output_type": "LLTF",
+  "complex_csi_enabled": true,
+  "csi_component_order": "imag_real_interleaved",
+  "channel_filter_enabled": false,
+  "csi_scale_shift": 0,
+  "calibration_role": "activity",
+  "calibration_id": "P001-R01-D01-S01-CAL01",
   "fall_type": "demonstrated_fall",
   "trial_id_prefix": "P001-R01-S01-",
   "collector_version": "console-csi-v7-research",
-  "notes": "Use pseudonymous participant IDs. Record every action in every session."
+  "notes": "AI main experiment: use a fixed ordinary router. Use pseudonymous participant IDs and record every action in every session."
 }

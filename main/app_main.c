@@ -99,6 +99,7 @@ static struct {
     struct arg_str *csi_output_format;
     struct arg_int *csi_scale_shift;
     struct arg_int *channel_filter;
+    struct arg_lit *physics_mode;
     struct arg_int *send_data_interval;
     struct arg_end *end;
 } radar_args;
@@ -434,6 +435,18 @@ static int wifi_cmd_radar(int argc, char **argv)
 #endif
     }
 
+    if (radar_args.physics_mode->count) {
+        esp_radar_config_t radar_config = {0};
+        esp_radar_get_config(&radar_config);
+        radar_config.csi_config.channel_filter_en = false;
+        radar_config.csi_config.manu_scale = false;
+        radar_config.csi_config.shift = 0;
+        radar_config.csi_config.csi_filtered_cb = wifi_csi_raw_cb;
+        esp_radar_change_config(&radar_config);
+        strcpy(g_console_input_config.csi_output_format, "base64");
+        ESP_LOGW(TAG, "physics_mode: raw signed I/Q enabled, component order=[imag,real], channel_filter=0, manual_scale=0; absolute phase is not calibrated");
+    }
+
     return ESP_OK;
 }
 
@@ -460,10 +473,11 @@ void cmd_register_radar(void)
     radar_args.csi_output_format = arg_str0(NULL, "csi_output_format", "<decimal, base64>", "Format of CSI data");
     radar_args.csi_scale_shift   = arg_int0(NULL, "scale_shift", "<0~15>", "manually left shift bits of the scale of the CSI data");
     radar_args.channel_filter    = arg_int0(NULL, "channel_filter", "<0 or 1>", "enable to turn on channel filter to smooth adjacent sub-carrier");
+    radar_args.physics_mode      = arg_lit0(NULL, "physics_mode", "Preserve raw signed I/Q for physics-guided processing");
 
     radar_args.send_data_interval = arg_int0(NULL, "send_data_interval", "<interval_ms>", "The interval between sending null data or ping packets to the router");
 
-    radar_args.end                = arg_end(8);
+    radar_args.end                = arg_end(9);
 
     const esp_console_cmd_t radar_cmd = {
         .command = "radar",

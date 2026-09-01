@@ -79,7 +79,9 @@ The sidecar stores experiment metadata, participant/room/session IDs, action sem
 | `rx_state`, `first_word_invalid` | 接收状态和首字异常标志；非零值需要质量检查。 |
 | `data` | CSI 的有符号原始字节数组。GUI 已从串口 Base64 解码后写入 CSV。 |
 
-`data` 不是直接可训练的 `(time, subcarrier)` 浮点矩阵。应依据 ESP-IDF 的 CSI 格式把相邻 I/Q 分量组成复数 `I + jQ`，再计算幅度 `sqrt(I²+Q²)` 和相位 `atan2(Q,I)`；具体字节宽度和 LTF 选择应结合 `csi_output_type`、芯片及 `len` 核对。不要在未验证布局时假设所有设备都有相同子载波数量。
+`data` 不是直接可训练的 `(time, subcarrier)` 浮点矩阵。ESP-IDF 顺序为 `[imag, real, ...]`，即复数应写为 `real + j·imag`；再计算幅度 `sqrt(real²+imag²)` 和相位 `atan2(imag,real)`。具体字节宽度和 LTF 选择应结合 `csi_output_type`、芯片及 `len` 核对。不要在未验证布局时假设所有设备都有相同子载波数量。普通路由器同样可以产生这些接收端 CSI，不要求 ESP32 发射端。
+
+当前研究模式将布局明确记录为 `imag_real_interleaved`，即 `data[0::2]` 为虚部、`data[1::2]` 为实部。`complex_csi.py` 会生成去子载波线性趋势的相位诊断。原始绝对相位受 CFO/SFO、包检测时延、AGC 和 RF 链偏置影响，不能直接解释为距离；详见仓库根目录 `PHYSICS_CSI_CAPTURE_CN.md`。
 
 ## 4. 标签解释 / Label interpretation
 
@@ -137,4 +139,3 @@ python validate_session.py data\R01\2026-09-01
 - [esp-csi-fall-detection](https://github.com/lixb123/esp-csi-fall-detection)
 
 下游仓库的早期数据使用旧版 `wave/move/static/none/front/after` 标签。新方向跌倒和细粒度日常动作需要在下游代码中显式加入映射，不能静默合并。
-

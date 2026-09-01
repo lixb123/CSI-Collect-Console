@@ -22,6 +22,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def as_bool(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def validate(session_root: Path, require_core_actions: bool = False) -> dict:
     manifest = session_root / "session_manifest.csv"
     errors: list[str] = []
@@ -133,6 +137,27 @@ def validate(session_root: Path, require_core_actions: bool = False) -> dict:
                     errors.append(f"No valid research packets within recording: {csv_path}")
             except ValueError:
                 errors.append(f"Invalid research packet count: {csv_path}")
+        if as_bool(row.get("complex_csi_enabled")):
+            if row.get("csi_component_order", "").strip() != "imag_real_interleaved":
+                errors.append(f"Unexpected complex CSI component order: {csv_path}")
+            if as_bool(row.get("channel_filter_enabled")):
+                errors.append(f"Physics CSI was captured with channel filtering enabled: {csv_path}")
+            try:
+                if int(float(row.get("csi_scale_shift", "0") or "0")) != 0:
+                    errors.append(f"Physics CSI was captured with manual scale shift: {csv_path}")
+                minimum = int(float(row.get("complex_subcarriers_min", "0") or "0"))
+                maximum = int(float(row.get("complex_subcarriers_max", "0") or "0"))
+                if (minimum, maximum) != (52, 52):
+                    errors.append(f"Physics CSI requires exactly 52 complex subcarriers ({minimum}, {maximum}): {csv_path}")
+            except ValueError:
+                errors.append(f"Invalid complex CSI numeric metadata: {csv_path}")
+            if as_bool(row.get("absolute_phase_valid")):
+                errors.append(f"Raw ESP32 absolute phase cannot be marked valid: {csv_path}")
+            if row.get("phase_quality_status", "").strip() != "usable_sanitized":
+                warnings.append(
+                    f"Relative phase is not eligible for the phase branch "
+                    f"(status={row.get('phase_quality_status', '')!r}): {csv_path}"
+                )
         if row.get("action") in FALL_ACTIONS and row.get("fall_type") not in {"demonstrated_fall", "incident_fall"}:
             errors.append(f"Fall action requires an explicit fall_type: {csv_path}")
     result = {

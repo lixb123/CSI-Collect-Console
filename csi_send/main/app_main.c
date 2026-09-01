@@ -48,6 +48,7 @@
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t BROADCAST_MAC[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 static const char *TAG = "research_tx";
+#define PHYSICS_PROBE_MAGIC 0x31595048u /* "HPY1" little-endian */
 
 typedef struct {
     char experiment_id[RESEARCH_EXPERIMENT_ID_LEN];
@@ -63,6 +64,8 @@ typedef struct {
     uint64_t callback_timeouts;
     uint64_t orphan_callbacks;
     uint64_t bytes_accepted;
+    bool physics_probe;
+    uint32_t probe_id;
 } research_tx_state_t;
 
 static research_tx_state_t g_tx = {
@@ -83,6 +86,8 @@ static struct {
     struct arg_lit *stop;
     struct arg_lit *reset_counters;
     struct arg_lit *status;
+    struct arg_lit *physics_probe;
+    struct arg_int *probe_id;
     struct arg_end *end;
 } tx_args;
 
@@ -198,6 +203,18 @@ static void transmitter_task(void *arg)
             portEXIT_CRITICAL(&g_tx_lock);
             continue;
         }
+        if (state.physics_probe && frame_length >= research_frame_header_size() + 16) {
+            uint8_t *probe = frame + research_frame_header_size();
+            uint32_t magic = PHYSICS_PROBE_MAGIC;
+            uint32_t probe_id = state.probe_id;
+            memcpy(probe, &magic, sizeof(magic));
+            memcpy(probe + 4, &probe_id, sizeof(probe_id));
+            memcpy(probe + 8, &sequence, sizeof(sequence));
+            uint32_t check = magic ^ probe_id ^ sequence;
+            memcpy(probe + 12, &check, sizeof(check));
+            ((research_frame_header_t *)frame)->crc32 = 0;
+            ((research_frame_header_t *)frame)->crc32 = research_crc32(frame, frame_length);
+        }
 
         ulTaskNotifyTake(pdTRUE, 0);
         portENTER_CRITICAL(&g_tx_lock);
@@ -310,7 +327,8 @@ static int research_tx_command(int argc, char **argv)
     }
     research_tx_state_t before = tx_snapshot();
     bool changing_config = tx_args.experiment_id->count || tx_args.interval_ms->count ||
-                           tx_args.payload_length->count || tx_args.reset_counters->count;
+                           tx_args.payload_length->count || tx_args.reset_counters->count ||
+                           tx_args.physics_probe->count || tx_args.probe_id->count;
     if (before.running && changing_config && !tx_args.stop->count) {
         printf("ERROR: stop transmission before changing experiment settings\n");
         return ESP_ERR_INVALID_STATE;
@@ -339,6 +357,8 @@ static int research_tx_command(int argc, char **argv)
     }
     if (tx_args.interval_ms->count) g_tx.interval_ms = (uint32_t)tx_args.interval_ms->ival[0];
     if (tx_args.payload_length->count) g_tx.payload_length = (uint16_t)tx_args.payload_length->ival[0];
+    if (tx_args.physics_probe->count) g_tx.physics_probe = true;
+    if (tx_args.probe_id->count) g_tx.probe_id = (uint32_t)tx_args.probe_id->ival[0];
     if (tx_args.reset_counters->count) tx_reset_counters_locked();
     if (tx_args.start->count) g_tx.running = true;
     portEXIT_CRITICAL(&g_tx_lock);
@@ -358,7 +378,9 @@ static void register_research_tx_command(void)
     tx_args.stop = arg_lit0(NULL, "stop", "stop transmission");
     tx_args.reset_counters = arg_lit0(NULL, "reset_counters", "reset sequence and counters while stopped");
     tx_args.status = arg_lit0(NULL, "status", "print current telemetry immediately");
-    tx_args.end = arg_end(8);
+    tx_args.physics_probe = arg_lit0(NULL, "physics_probe", "embed a deterministic probe marker in each application payload");
+    tx_args.probe_id = arg_int0(NULL, "probe_id", "<id>", "physics probe/calibration ID");
+    tx_args.end = arg_end(10);
     const esp_console_cmd_t command = {
         .command = "research_tx",
         .help = "Configure the research ESP-NOW transmitter",

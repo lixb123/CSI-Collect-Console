@@ -1,10 +1,10 @@
 # CSI-Collect-Console
 
-[English](README.md) · [研究采集设计](RESEARCH_CAPTURE.md) · [数据格式详解](tools/data/README.md)
+[English](README.md) · [研究采集设计](RESEARCH_CAPTURE.md) · [复数 I/Q 物理采集](PHYSICS_CSI_CAPTURE_CN.md) · [数据格式详解](tools/data/README.md)
 
 `CSI-Collect-Console` 是面向 AI、ISAC 和 ISCC 实验的 ESP32-S3 Wi-Fi CSI 采集系统，包括：
 
-- ESP-NOW 研究发射端 `csi_send`；
+- 普通 Wi-Fi 路由器（AI 主实验默认）或可选 ESP-NOW 研究发射端 `csi_send`；
 - 仓库根目录下的 CSI 接收与串口遥测固件；
 - PyQt5 桌面采集工具 `tools/esp_csi_tool.py`；
 - 中英文界面、参数记忆、等待/采集双倒计时和规范化实验元数据；
@@ -30,7 +30,9 @@ cd CSI-Collect-Console
 
 编译前请打开 ESP-IDF 5.5.5 终端。
 
-## 编译并烧录发射端
+## 可选：编译并烧录研究发射端
+
+以 AI 方法为重点时可跳过本节，直接使用固定的普通路由器；复数 I/Q 由接收端采集，不要求 ESP32 发射端。只有需要 ISAC/ISCC 包标记和发送端遥测时才烧录 `csi_send`。
 
 ```powershell
 cd csi_send

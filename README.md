@@ -1,6 +1,8 @@
 # CSI-Collect-Console
 
-[中文说明](README_cn.md) · [Research capture details](RESEARCH_CAPTURE.md) · [Data format](tools/data/README.md)
+For AI-focused experiments, an ordinary fixed Wi-Fi router is the default transmitter; the ESP32 `csi_send` firmware is optional. Complex I/Q is captured by the ESP32-S3 receiver and does not require an ESP32 transmitter.
+
+[中文说明](README_cn.md) · [Research capture details](RESEARCH_CAPTURE.md) · [Complex I/Q physics capture (Chinese)](PHYSICS_CSI_CAPTURE_CN.md) · [Data format](tools/data/README.md)
 
 `CSI-Collect-Console` is an ESP32-S3 Wi-Fi CSI collection system for AI, ISAC, and ISCC experiments. It includes:
 

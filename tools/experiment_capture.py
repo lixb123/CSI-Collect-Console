@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from complex_csi import ComplexCSIQuality, complex_layout_metadata
+
 
 SCHEMA_VERSION = "csi-experiment-manifest/1.0"
 FALL_ACTION = "wave"
@@ -38,6 +40,9 @@ MANIFEST_COLUMNS = [
     "router_id", "receiver_id", "sender_id", "router_position",
     "receiver_position", "sender_position", "orientation", "distance_m",
     "scenario", "occupancy", "interference_condition", "csi_output_type",
+    "complex_csi_enabled", "csi_component_order", "phase_sanitization",
+    "absolute_phase_valid", "channel_filter_enabled", "csi_scale_shift",
+    "calibration_role", "calibration_id",
     "send_mode", "configured_send_interval_ms", "observed_send_mode",
     "observed_send_interval_ms", "transmitter_experiment_id", "transmitter_experiment_hash",
     "observed_transmitter_experiment_hash", "configured_duration_ms",
@@ -47,6 +52,9 @@ MANIFEST_COLUMNS = [
     "rssi_mean", "rssi_std", "noise_floor_mean", "agc_gain_mean",
     "channel_primary", "channel_secondary", "mcs", "bandwidth",
     "csi_len", "rx_state_nonzero", "first_word_invalid_count",
+    "complex_frames", "complex_invalid_frames", "complex_subcarriers_min", "complex_subcarriers_max",
+    "complex_low_amplitude_fraction", "phase_residual_rms_mean",
+    "phase_adjacent_coherence_mean", "phase_temporal_step_rms_mean", "phase_quality_status",
     "device_csi_received_delta", "device_queue_drop_delta",
     "receiver_valid_research_packets_delta", "receiver_research_bytes_delta",
     "receiver_research_crc_errors_delta", "receiver_research_other_errors_delta",
@@ -170,6 +178,16 @@ def load_experiment_config(path: str | os.PathLike[str] | None) -> dict[str, Any
     config.setdefault("date", datetime.now().date().isoformat())
     config.setdefault("fall_type", "demonstrated_fall" if config.get("default_action") == FALL_ACTION else "")
     config.setdefault("collector_version", "console-csi-v7-research")
+    config.setdefault("complex_csi_enabled", True)
+    config.setdefault("csi_component_order", "imag_real_interleaved")
+    config.setdefault("channel_filter_enabled", False)
+    config.setdefault("csi_scale_shift", 0)
+    config.setdefault("calibration_role", "activity")
+    config.setdefault("calibration_id", "")
+    if config["csi_component_order"] != "imag_real_interleaved":
+        raise ValueError("csi_component_order must be imag_real_interleaved for ESP-IDF CSI")
+    if config["calibration_role"] not in {"activity", "empty_room_reference", "static_reference"}:
+        raise ValueError("calibration_role must be activity, empty_room_reference, or static_reference")
     config.setdefault("notes", "")
     config.setdefault("transmitter_experiment_id", safe_text(config["session_id"]))
     transmitter_experiment_id = safe_text(config["transmitter_experiment_id"])
@@ -223,6 +241,7 @@ class RecordingAccumulator:
     minimum_free_heap: list[float] = field(default_factory=list)
     queue_high_water_since_boot: list[float] = field(default_factory=list)
     last_radio: dict[str, Any] = field(default_factory=dict)
+    complex_quality: ComplexCSIQuality = field(default_factory=ComplexCSIQuality)
 
     def add(self, row: dict[str, Any], host_received_ns: int, host_written_ns: int) -> None:
         seq = safe_int(row.get("seq"))
@@ -247,6 +266,8 @@ class RecordingAccumulator:
         self.last_radio = {key: row.get(key, "") for key in (
             "channel_primary", "channel_secondary", "mcs", "cwb", "len", "rate", "sig_mode", "mac"
         )}
+        if row.get("data") is not None:
+            self.complex_quality.add(row.get("data"))
         self.rows += 1
 
     def add_telemetry(self, row: dict[str, Any]) -> None:
@@ -308,6 +329,10 @@ class ExperimentLedger:
             "occupancy": safe_text(self.config.get("occupancy")),
             "interference_condition": safe_text(self.config.get("interference_condition")),
             "csi_output_type": safe_text(self.config.get("csi_output_type", "LLTF")),
+            "complex_csi_enabled": safe_text(self.config.get("complex_csi_enabled", True)),
+            "csi_component_order": safe_text(self.config.get("csi_component_order", "imag_real_interleaved")),
+            "channel_filter_enabled": safe_text(self.config.get("channel_filter_enabled", False)),
+            "csi_scale_shift": safe_text(self.config.get("csi_scale_shift", 0)),
             "send_mode": safe_text(self.config.get("send_mode", "router_ping")),
             "configured_send_interval_ms": safe_text(self.config.get("send_interval_ms")),
             "transmitter_experiment_id": safe_text(self.config.get("transmitter_experiment_id", self.config["session_id"])),
@@ -329,6 +354,19 @@ class ExperimentLedger:
 
     def note_device_info(self, row: dict[str, Any]) -> None:
         self.device_info = dict(row)
+
+    def update_capture_role(self, *, complex_csi_enabled: bool, calibration_role: str) -> None:
+        if self.active is not None:
+            raise RuntimeError("Cannot update the capture role while a recording is active")
+        if calibration_role not in {"activity", "empty_room_reference", "static_reference"}:
+            raise ValueError(f"Unsupported calibration role: {calibration_role}")
+        self.config.update({
+            "complex_csi_enabled": bool(complex_csi_enabled),
+            "csi_component_order": "imag_real_interleaved",
+            "channel_filter_enabled": False,
+            "csi_scale_shift": 0,
+            "calibration_role": calibration_role,
+        })
 
     def begin(self, csv_path: Path, action: str, target_seq: str, duration_ms: int | None = None) -> RecordingAccumulator:
         if self.active is not None:
@@ -412,6 +450,9 @@ class ExperimentLedger:
             "occupancy": self.config.get("occupancy", ""),
             "interference_condition": self.config.get("interference_condition", ""),
             "csi_output_type": self.config.get("csi_output_type", "LLTF"),
+            **complex_layout_metadata(self.config),
+            "calibration_role": self.config.get("calibration_role", "activity"),
+            "calibration_id": self.config.get("calibration_id", ""),
             "send_mode": self.config.get("send_mode", "router_ping"),
             "configured_send_interval_ms": self.config.get("send_interval_ms", ""),
             "observed_send_mode": telemetry_end.get("send_mode", ""),
@@ -442,6 +483,7 @@ class ExperimentLedger:
             "csi_len": recording.last_radio.get("len", ""),
             "rx_state_nonzero": recording.rx_state_nonzero,
             "first_word_invalid_count": recording.first_word_invalid_count,
+            **recording.complex_quality.summary(),
             "device_csi_received_delta": max(0, end_rx - start_rx)
             if start_rx is not None and end_rx is not None else None,
             "device_queue_drop_delta": max(0, end_drop - start_drop)

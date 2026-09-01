@@ -19,6 +19,8 @@ venv/
 # Personal configuration: may contain a Wi-Fi password
 tools/config/gui_config.json
 tools/config/experiment_config.json
+# Older launches from the repository root wrote the same local preference here.
+config/gui_config.json
 
 # Runtime data and logs. Keep the data documentation tracked.
 tools/data/*
@@ -30,4 +32,3 @@ tools/log/
 Thumbs.db
 *.swp
 *.tmp
-

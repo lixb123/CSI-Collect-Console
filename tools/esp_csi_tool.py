@@ -361,6 +361,31 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             'QLineEdit { background-color: #eef9ed; border: 1px solid #5a9f59; '
             'border-radius: 4px; padding: 4px 8px; font-weight: 600; }'
         )
+        self.label_complex_csi = QLabel(self.groupBox_18)
+        self.checkBox_complex_csi = QCheckBox(self.groupBox_18)
+        self.checkBox_complex_csi.setChecked(bool(
+            (self.experiment_config or {}).get('complex_csi_enabled',
+                self.gui_config.get('complex_csi_enabled', True))))
+        self.comboBox_calibration_role = QComboBox(self.groupBox_18)
+        self.comboBox_calibration_role.addItem('Activity', 'activity')
+        self.comboBox_calibration_role.addItem('Empty-room reference', 'empty_room_reference')
+        self.comboBox_calibration_role.addItem('Static-person reference', 'static_reference')
+        saved_role = (self.experiment_config or {}).get(
+            'calibration_role', self.gui_config.get('calibration_role', 'activity'))
+        role_index = self.comboBox_calibration_role.findData(saved_role)
+        if role_index >= 0:
+            self.comboBox_calibration_role.setCurrentIndex(role_index)
+        # Keep identity/location on their own row.  The physics controls have
+        # longer bilingual labels and were too compressed at 1366x768 when
+        # appended to the metadata row.
+        self.horizontalLayout_physics_csi = QHBoxLayout()
+        self.horizontalLayout_physics_csi.setSpacing(10)
+        self.horizontalLayout_physics_csi.addWidget(self.label_complex_csi)
+        self.horizontalLayout_physics_csi.addWidget(self.checkBox_complex_csi)
+        self.horizontalLayout_physics_csi.addWidget(self.comboBox_calibration_role, 1)
+        self.horizontalLayout_physics_csi.addStretch(2)
+        self.verticalLayout_3.insertLayout(1, self.horizontalLayout_physics_csi)
+        self.groupBox_18.setMinimumHeight(270)
         self.collect_overlay = QFrame(self.centralwidget)
         self.collect_overlay.setObjectName('collect_overlay')
         self.collect_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -567,10 +592,10 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
 
         # Give the collection controls enough vertical space for the separate
         # participant and location metadata row at common laptop resolutions.
-        self.splitter_3.setStretchFactor(0, 4)
+        self.splitter_3.setStretchFactor(0, 5)
         self.splitter_3.setStretchFactor(1, 3)
         self.splitter_3.setStretchFactor(2, 3)
-        self.splitter_3.setSizes([300, 240, 250])
+        self.splitter_3.setSizes([350, 220, 230])
 
         self.textBrowser_log.setStyleSheet('background:black')
 
@@ -606,6 +631,9 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.collect_action_label = ''
         self.collect_delay_remaining = 0
         self.collect_duration_remaining = 0
+        self.checkBox_complex_csi.stateChanged.connect(self.update_physics_capture_config)
+        self.comboBox_calibration_role.currentIndexChanged.connect(self.update_physics_capture_config)
+        self.update_physics_capture_config()
 
         self.train_duration = self.timeEdit_train_duration.time()
         self.timer_train_duration = QTimer()
@@ -680,6 +708,16 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.groupBox_18.setTitle('Collection controls and experiment labels' if en else '采集控制与实验标签')
         self.label_participant_id.setText('Participant label (participant_id)' if en else '人员标签（participant_id）')
         self.label_room_id.setText('Location label (room_id)' if en else '地点标签（room_id）')
+        self.label_complex_csi.setText('Physics CSI' if en else '物理 CSI')
+        self.checkBox_complex_csi.setText('Save complex I/Q' if en else '保存复数 I/Q')
+        role = self.comboBox_calibration_role.currentData()
+        role_labels = (['Activity', 'Empty-room reference', 'Static-person reference'] if en else
+                       ['动作采集', '空房参考', '静止人员参考'])
+        for index, label in enumerate(role_labels):
+            self.comboBox_calibration_role.setItemText(index, label)
+        role_index = self.comboBox_calibration_role.findData(role)
+        if role_index >= 0:
+            self.comboBox_calibration_role.setCurrentIndex(role_index)
         self.label_target_4.setText('Activity label' if en else '采集动作')
         self.label_delay.setText('Wait before each trial' if en else '每次等待')
         self.label_duration.setText('Collection duration' if en else '采集时长')
@@ -1088,8 +1126,25 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             self.lineEdit_participant_id, self.lineEdit_room_id,
             self.comboBox_collect_target, self.timeEdit_collect_delay,
             self.spinBox_collect_duration, self.spinBox_collect_number,
+            self.checkBox_complex_csi, self.comboBox_calibration_role,
         ):
             widget.setEnabled(enabled)
+
+    def update_physics_capture_config(self):
+        enabled = self.checkBox_complex_csi.isChecked()
+        role = self.comboBox_calibration_role.currentData() or 'activity'
+        if self.experiment_config is not None:
+            self.experiment_config['complex_csi_enabled'] = enabled
+            self.experiment_config['csi_component_order'] = 'imag_real_interleaved'
+            self.experiment_config['channel_filter_enabled'] = False
+            self.experiment_config['csi_scale_shift'] = 0
+            self.experiment_config['calibration_role'] = role
+        self.serial_queue_write.put({
+            'type': 'update_physics_capture',
+            'complex_csi_enabled': enabled,
+            'calibration_role': role,
+        })
+        self.save_gui_config(complex_csi_enabled=enabled, calibration_role=role)
 
     def apply_collection_metadata(self):
         participant_id = self.lineEdit_participant_id.text().strip()
@@ -1133,6 +1188,8 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             'type': 'update_collection_metadata',
             'participant_id': participant_id,
             'room_id': room_id,
+            'complex_csi_enabled': self.checkBox_complex_csi.isChecked(),
+            'calibration_role': self.comboBox_calibration_role.currentData() or 'activity',
         })
         try:
             self.save_gui_config(participant_id=participant_id, room_id=room_id)
@@ -1242,6 +1299,8 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                 collect_wait_seconds=self.timeEdit_collect_delay.value(),
                 collect_duration_seconds=self.spinBox_collect_duration.value(),
                 collect_number=self.spinBox_collect_number.value(),
+                complex_csi_enabled=self.checkBox_complex_csi.isChecked(),
+                calibration_role=self.comboBox_calibration_role.currentData() or 'activity',
             )
             self.pushButton_collect_start.setText(self.tr_text('停止', 'Stop'))
             self.pushButton_collect_start.setStyleSheet('color: red')
@@ -1346,6 +1405,8 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             collect_duration_seconds=self.spinBox_collect_duration.value(),
             collect_number=self.spinBox_collect_number.value(),
             language=self.language,
+            complex_csi_enabled=self.checkBox_complex_csi.isChecked(),
+            calibration_role=self.comboBox_calibration_role.currentData() or 'activity',
         )
         self.serial_queue_write.put('exit')
         event.accept()
@@ -1538,6 +1599,8 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                 return
             if isinstance(command, dict) and command.get('type') == 'update_collection_metadata':
                 continue
+            if isinstance(command, dict) and command.get('type') == 'update_physics_capture':
+                continue
             queue_read.put(pd.Series(
                 index=['type', 'tag', 'timestamp', 'data'],
                 data=['LOG_DATA', 'W', '离线', f'未连接 ESP32，已忽略命令：{command}']
@@ -1684,6 +1747,32 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                 active_participant_id = participant_id
                 active_room_id = room_id
                 print(f'采集标签已更新：人员={participant_id}，地点={room_id}')
+                continue
+
+            if isinstance(command, dict) and command.get('type') == 'update_physics_capture':
+                if ledger is not None and ledger.active is not None:
+                    queue_read.put(pd.Series(
+                        index=['type', 'tag', 'timestamp', 'data'],
+                        data=['LOG_DATA', 'E', '物理 CSI', '采集进行中，不能修改复数 CSI 或校准角色。']
+                    ))
+                    continue
+                enabled = bool(command.get('complex_csi_enabled', True))
+                role = str(command.get('calibration_role', 'activity'))
+                if role not in {'activity', 'empty_room_reference', 'static_reference'}:
+                    continue
+                if experiment_config is not None:
+                    experiment_config['complex_csi_enabled'] = enabled
+                    experiment_config['csi_component_order'] = 'imag_real_interleaved'
+                    experiment_config['channel_filter_enabled'] = False
+                    experiment_config['csi_scale_shift'] = 0
+                    experiment_config['calibration_role'] = role
+                    if ledger is not None:
+                        ledger.update_capture_role(
+                            complex_csi_enabled=enabled, calibration_role=role)
+                # Disable channel smoothing and manual scaling so the stored
+                # I/Q bytes remain suitable for physics-guided processing.
+                set.write(b'radar --physics_mode\r\n')
+                print(f'物理 CSI 配置已更新：complex={enabled}, role={role}')
                 continue
 
             collect_match = re.search(r'--collect_duration\s+(\d+)', command)

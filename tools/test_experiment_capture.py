@@ -281,6 +281,7 @@ class SessionValidatorTest(unittest.TestCase):
                         "local_timestamp": 1_000_000 + frame_index * 10_000,
                         "rssi": -50, "noise_floor": -95, "agc_gain": 8,
                         "rx_state": 0, "first_word_invalid": 0, "len": 104,
+                        "data": [1, 2] * 52,
                     }, 5_000_000_000 + frame_index * 10_000_000,
                        5_000_500_000 + frame_index * 10_000_000)
                 ledger.note_telemetry({
