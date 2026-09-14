@@ -97,9 +97,9 @@ python esp_csi_tool.py -p COM_RX
 
 The default window opens in English with Radar model enabled and Wi-Fi Auto connect disabled. The Collection panel is independent from Radar model: Activity occupies its own row, Raw data and Collection start at equal widths, and disabling Radar model hides its complete panel and title while leaving collection controls active. See [tools/GUI使用说明_CN.md](tools/GUI使用说明_CN.md) for the interface, curve colors, units, and operator procedure.
 
-![CSI-Collect-Console interface layout](docs/_static/csi-collector-layout.svg)
+![CSI-Collect-Console actual interface](docs/_static/csi-collector-interface.png)
 
-The illustration shows the default arrangement: Raw data and Collection share the upper display area, Activity uses a full row inside Collection, and Radar model is an independent lower panel.
+The screenshot shows the actual collector window in offline mode: Raw data and Collection share the upper display area, Activity uses a full row inside Collection, and Radar model is an independent lower panel.
 
 The trigger dropdown can be changed at runtime:
 

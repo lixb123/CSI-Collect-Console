@@ -95,9 +95,9 @@ python esp_csi_tool.py -p COM_RX
 
 默认界面使用 English、打开 Radar model，并关闭 Wi-Fi Auto connect。Collection 是独立区域：Activity 单独占一行，Raw data 与 Collection 默认各占一半宽度；取消 Radar model 后，Radar model 的标题和内容一起隐藏，Collection 采集控件仍可用。界面说明、曲线颜色、单位和现场操作步骤见 [tools/GUI使用说明_CN.md](tools/GUI使用说明_CN.md)。
 
-![CSI-Collect-Console 界面布局示意图](docs/_static/csi-collector-layout.svg)
+![CSI-Collect-Console 实际界面截图](docs/_static/csi-collector-interface.png)
 
-图中展示默认布局：Raw data 与 Collection 位于上方并列区域，Activity 在 Collection 中独占一行，Radar model 位于下方并可整体隐藏。
+截图展示了实际采集界面：Raw data 与 Collection 位于上方并列区域，Activity 在 Collection 中独占一行，Radar model 位于下方并可整体隐藏。
 
 触发方式可以在运行时切换：
 
