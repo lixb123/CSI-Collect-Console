@@ -8,6 +8,8 @@
 - 仓库根目录下的 CSI 接收与串口遥测固件；
 - PyQt5 桌面采集工具 `tools/esp_csi_tool.py`；
 - 中英文界面、参数记忆、等待/采集双倒计时和规范化实验元数据；
+- 可运行时切换 `router_ping` 与 `null_data`，切换触发方式不需要重新烧录接收端；
+- 可选的 ESP32-S3 SoftAP 发射端，使用现有 SSID/密码输入框即可切换；
 - 按地点和日期归档的 CSV、逐记录 sidecar 与日清单。
 
 采集后的清洗、质量控制、模型训练、基准、图片和论文处理结果位于 [lixb123/esp-csi-fall-detection](https://github.com/lixb123/esp-csi-fall-detection)。本仓库负责采集，后者负责数据处理与实验结果。后者的早期发布使用 `wave/move/static/none/front/after` 旧标签，新采集的细粒度动作必须显式映射。
@@ -91,6 +93,17 @@ python esp_csi_tool.py
 python esp_csi_tool.py -p COM_RX
 ```
 
+默认界面使用 English、打开 Radar model，并关闭 Wi-Fi Auto connect。Collection 是独立区域：Activity 单独占一行，Raw data 与 Collection 默认各占一半宽度；取消 Radar model 后，Radar model 的标题和内容一起隐藏，Collection 采集控件仍可用。界面说明、曲线颜色、单位和现场操作步骤见 [tools/GUI使用说明_CN.md](tools/GUI使用说明_CN.md)。
+
+触发方式可以在运行时切换：
+
+- `router_ping`：适用于普通路由器和 ESP32-S3 SoftAP，兼容性最广；
+- `null_data`：由接收端发送 802.11 Null Data 帧，通常能提高 CSI 到达率，但会增加 Wi-Fi 控制流量。
+
+同一个 session 内应保持一种触发方式。切换后请新建 session，并重新采集空房和静止人员参考。串口等效命令为 `radar --send_mode router_ping` 和 `radar --send_mode null_data`。
+
+专用 SoftAP 发射端的编译、烧录和连接步骤见 [ESP32S3_SOFTAP_CSI_GUIDE_CN.md](ESP32S3_SOFTAP_CSI_GUIDE_CN.md)。接收端 GUI 不需要新增控件：先断开连接，填写 SoftAP 的 SSID 和 WPA2 密码，再使用原有 Wi-Fi 连接按钮。
+
 需要研究级元数据、manifest 和 sidecar 时：
 
 ```powershell
@@ -107,9 +120,9 @@ python esp_csi_tool.py -p COM_RX `
 ## 采集流程
 
 1. 确认 TX/RX 信道和实验 ID 一致；
-2. 填写人员标签与地点标签；
+2. 填写人员、地点、接收设备标签和 Tx-Rx 距离（m）；
 3. 选择动作；中英文切换只改变显示，不改变英文机器标签；
-4. 设置每次等待、采集时长和次数；
+4. 设置每次等待、采集时长和次数；串口设备变化后点击 Serial Refresh 重新扫描端口；
 5. 点击开始，每轮执行“等待倒计时 → 采集倒计时”，然后重复；
 6. 采集后检查 manifest 并在训练前校验。
 

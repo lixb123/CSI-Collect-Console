@@ -10,6 +10,8 @@ For AI-focused experiments, an ordinary fixed Wi-Fi router is the default transm
 - a CSI receiver and serial telemetry firmware (repository root);
 - a PyQt5 desktop collector (`tools/esp_csi_tool.py`);
 - bilingual Chinese/English UI, remembered collection settings, per-trial wait/recording countdowns, and structured experiment metadata;
+- a runtime trigger selector for `router_ping` and `null_data`, with no receiver reflash required when switching modes;
+- an optional ESP32-S3 SoftAP transmitter that can be selected through the existing SSID/password controls;
 - room/date-organized CSV exports, JSON sidecars, and a day-level manifest.
 
 The downstream cleaning, quality-control, benchmark, training, figures, and paper results are maintained in [lixb123/esp-csi-fall-detection](https://github.com/lixb123/esp-csi-fall-detection). This repository is the acquisition source; the other repository is the processing/result repository. Earlier downstream releases use the legacy labels `wave/move/static/none/front/after`, so new fine-grained labels must be mapped explicitly.
@@ -93,6 +95,17 @@ The last command opens offline mode without an ESP32, which is useful for config
 python esp_csi_tool.py -p COM_RX
 ```
 
+The default window opens in English with Radar model enabled and Wi-Fi Auto connect disabled. The Collection panel is independent from Radar model: Activity occupies its own row, Raw data and Collection start at equal widths, and disabling Radar model hides its complete panel and title while leaving collection controls active. See [tools/GUI使用说明_CN.md](tools/GUI使用说明_CN.md) for the interface, curve colors, units, and operator procedure.
+
+The trigger dropdown can be changed at runtime:
+
+- `router_ping` works with an ordinary router or the optional ESP32-S3 SoftAP and has the broadest compatibility;
+- `null_data` sends 802.11 Null Data frames and usually provides a higher CSI arrival rate, at the cost of extra Wi-Fi control traffic.
+
+Keep one trigger mode for a session. Start a new session after changing it, and repeat the empty-room and static-person reference captures. The equivalent serial commands are `radar --send_mode router_ping` and `radar --send_mode null_data`.
+
+For a dedicated SoftAP transmitter, see [ESP32S3_SOFTAP_CSI_GUIDE_CN.md](ESP32S3_SOFTAP_CSI_GUIDE_CN.md). The receiver GUI does not need a new control: disconnect, enter the SoftAP SSID and WPA2 password, then connect using the existing Wi-Fi controls.
+
 For research metadata and an auditable manifest:
 
 ```powershell
@@ -109,9 +122,9 @@ Use pseudonymous participant IDs such as `P001`; do not enter names or contact d
 ## Collection workflow
 
 1. Confirm that TX and RX use the same channel and experiment ID.
-2. Enter a participant label and location label.
+2. Enter participant, location, receiver, and Tx-Rx distance (m) labels.
 3. Select an action. The machine label remains English even when the UI is Chinese.
-4. Set the wait time, recording duration, and number of trials.
+4. Set the wait time, recording duration, and number of trials. Use Serial Refresh after connecting or disconnecting a USB/UART board.
 5. Press Start. Each trial runs `wait countdown -> recording countdown`, then repeats.
 6. Inspect the manifest and validate the recording before training.
 

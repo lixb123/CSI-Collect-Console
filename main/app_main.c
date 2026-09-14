@@ -23,6 +23,10 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "esp_app_desc.h"
+#include "esp_chip_info.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_err.h"
 #include "esp_console.h"
@@ -56,7 +60,9 @@ static led_strip_handle_t led_strip;
 #else
 #define WS2812_GPIO 4
 #endif
+#if CONFIG_RESEARCH_RX_ESPNOW_MODE
 #define RECV_ESPNOW_CSI
+#endif
 #define CONFIG_LESS_INTERFERENCE_CHANNEL    11
 #define CONFIG_SEND_DATA_FREQUENCY          100
 
@@ -80,6 +86,16 @@ static volatile uint32_t g_research_rx_experiment_hash = 0;
 static bool g_research_rx_has_seq = false;
 static portMUX_TYPE g_research_rx_lock = portMUX_INITIALIZER_UNLOCKED;
 
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
+typedef enum {
+    CSI_TRIGGER_ROUTER_PING = 0,
+    CSI_TRIGGER_NULL_DATA = 1,
+} csi_trigger_mode_t;
+
+static volatile csi_trigger_mode_t g_trigger_mode = CSI_TRIGGER_ROUTER_PING;
+static TaskHandle_t g_trigger_task_handle = NULL;
+#endif
+
 static struct {
     struct arg_lit *train_start;
     struct arg_lit *train_stop;
@@ -101,6 +117,7 @@ static struct {
     struct arg_int *channel_filter;
     struct arg_lit *physics_mode;
     struct arg_int *send_data_interval;
+    struct arg_str *send_mode;
     struct arg_end *end;
 } radar_args;
 static struct console_input_config {
@@ -130,6 +147,21 @@ static struct console_input_config {
 
 static TimerHandle_t g_collect_timer_handele = NULL;
 static void trigger_router_send_data_task(void *arg);
+
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
+static const char *csi_trigger_mode_name(csi_trigger_mode_t mode)
+{
+    return mode == CSI_TRIGGER_NULL_DATA ? "null_data" : "router_ping";
+}
+
+static void ensure_trigger_task(void)
+{
+    if (g_wifi_connect_status && g_trigger_task_handle == NULL) {
+        xTaskCreate(trigger_router_send_data_task, "trigger_router_send_data", 4 * 1024,
+                    NULL, 5, &g_trigger_task_handle);
+    }
+}
+#endif
 
 static research_frame_result_t decode_research_payload(
     const uint8_t *payload, size_t payload_length, research_frame_header_t *header)
@@ -210,17 +242,15 @@ void wifi_csi_raw_cb(void *ctx, const wifi_csi_filtered_info_t *info)
 
 static void system_telemetry_task(void *arg)
 {
-#if CONFIG_RESEARCH_RX_ESPNOW_MODE
-    const char *send_mode = "espnow_research";
-#elif WIFI_CSI_SEND_NULL_DATA_ENABLE
-    const char *send_mode = "null_data";
-#else
-    const char *send_mode = "router_ping";
-#endif
     printf("type,device_uptime_ms,csi_received,queue_drops,queue_depth,queue_high_water,free_heap,minimum_free_heap,send_interval_ms,send_mode,"
            "research_rx_valid,research_rx_crc_errors,research_rx_other_errors,research_rx_seq_gaps,research_rx_bytes,"
            "research_rx_last_seq,research_rx_experiment_hash\n");
     while (true) {
+#if CONFIG_RESEARCH_RX_ESPNOW_MODE
+        const char *send_mode = "espnow_research";
+#else
+        const char *send_mode = csi_trigger_mode_name(g_trigger_mode);
+#endif
         uint32_t queue_depth = g_csi_info_queue ? uxQueueMessagesWaiting(g_csi_info_queue) : 0;
         uint32_t research_valid;
         uint32_t research_crc_errors;
@@ -341,6 +371,13 @@ static int wifi_cmd_radar(int argc, char **argv)
         } else {
             radar_config.csi_config.csi_filtered_cb = wifi_csi_raw_cb;
             strcpy(g_console_input_config.csi_output_type, radar_args.csi_output_type->sval[0]);
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
+            /* The GUI restarts radar with a fresh config.  Connected-AP mode
+             * must keep an empty source filter so router and SoftAP frames
+             * are both accepted after that restart. */
+            memset(radar_config.csi_config.filter_mac, 0,
+                   sizeof(radar_config.csi_config.filter_mac));
+#endif
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
             if (!strcasecmp(radar_args.csi_output_type->sval[0], "LLTF")) {
                 radar_config.csi_config.acquire_csi_lltf = true;
@@ -430,10 +467,26 @@ static int wifi_cmd_radar(int argc, char **argv)
         /* A running ping session copies interval_ms at creation time. Recreate
          * it so the observed device setting matches the actual packet rate. */
         if (g_wifi_connect_status) {
-            xTaskCreate(trigger_router_send_data_task, "restart_router_send_data", 4 * 1024, NULL, 5, NULL);
+            xTaskCreate(trigger_router_send_data_task, "restart_router_send_data", 4 * 1024, NULL, 5, &g_trigger_task_handle);
         }
 #endif
     }
+
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
+    if (radar_args.send_mode->count) {
+        const char *requested = radar_args.send_mode->sval[0];
+        if (!strcasecmp(requested, "null_data")) {
+            g_trigger_mode = CSI_TRIGGER_NULL_DATA;
+        } else if (!strcasecmp(requested, "router_ping")) {
+            g_trigger_mode = CSI_TRIGGER_ROUTER_PING;
+        } else {
+            ESP_LOGE(TAG, "send_mode must be router_ping or null_data");
+            return ESP_ERR_INVALID_ARG;
+        }
+        ESP_LOGI(TAG, "CSI trigger mode set to %s", csi_trigger_mode_name(g_trigger_mode));
+        ensure_trigger_task();
+    }
+#endif
 
     if (radar_args.physics_mode->count) {
         esp_radar_config_t radar_config = {0};
@@ -476,8 +529,9 @@ void cmd_register_radar(void)
     radar_args.physics_mode      = arg_lit0(NULL, "physics_mode", "Preserve raw signed I/Q for physics-guided processing");
 
     radar_args.send_data_interval = arg_int0(NULL, "send_data_interval", "<interval_ms>", "The interval between sending null data or ping packets to the router");
+    radar_args.send_mode          = arg_str0(NULL, "send_mode", "<router_ping|null_data>", "Select the connected-AP CSI trigger");
 
-    radar_args.end                = arg_end(9);
+    radar_args.end                = arg_end(10);
 
     const esp_console_cmd_t radar_cmd = {
         .command = "radar",
@@ -505,7 +559,6 @@ static void csi_data_print_task(void *arg)
             len += sprintf(buffer + len, "type,sequence,timestamp,taget_seq,target,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_state,agc_gain,fft_gain,len,first_word,data\n");
         }
         uint16_t valid_len = info->valid_len;
-        ESP_LOGI(TAG, "info->valid_len1: %d", info->valid_len);
         if (!strcasecmp(g_console_input_config.csi_output_type, "LLTF")) {
             info->valid_len = info->valid_lltf_len;
         } else if (!strcasecmp(g_console_input_config.csi_output_type, "HT-LTF")) {
@@ -672,23 +725,7 @@ static void wifi_radar_cb(void *ctx, const wifi_radar_info_t *info)
 
 static void trigger_router_send_data_task(void *arg)
 {
-    esp_radar_config_t radar_config = {0};
-    wifi_ap_record_t ap_info         = {0};
-    uint8_t sta_mac[6]               = {0};
-
-    esp_radar_get_config(&radar_config);
-    esp_wifi_sta_get_ap_info(&ap_info);
-    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, sta_mac));
-
-    radar_config.csi_config.csi_recv_interval = g_send_data_interval;
-    memcpy(radar_config.csi_config.filter_dmac, sta_mac, sizeof(radar_config.csi_config.filter_dmac));
-
-#if WIFI_CSI_SEND_NULL_DATA_ENABLE
-    ESP_LOGI(TAG, "Send null data to router");
-
-    memset(radar_config.csi_config.filter_mac, 0, sizeof(radar_config.csi_config.filter_mac));
-    esp_radar_change_config(&radar_config);
-
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
     typedef struct {
         uint8_t frame_control[2];
         uint16_t duration;
@@ -697,67 +734,99 @@ static void trigger_router_send_data_task(void *arg)
         uint8_t broadcast_address[6];
         uint16_t sequence_control;
     } __attribute__((packed)) wifi_null_data_t;
-
-    wifi_null_data_t null_data = {
-        .frame_control       = {0x48, 0x01},
-        .duration            = 0x0000,
-        .sequence_control    = 0x0000,
-    };
-
-    memcpy(null_data.destination_address, ap_info.bssid, 6);
-    memcpy(null_data.broadcast_address, ap_info.bssid, 6);
-    memcpy(null_data.source_address, sta_mac, 6);
-
-    ESP_LOGW(TAG, "null_data, destination_address: "MACSTR", source_address: "MACSTR", broadcast_address: " MACSTR,
-             MAC2STR(null_data.destination_address), MAC2STR(null_data.source_address), MAC2STR(null_data.broadcast_address));
-
-    ESP_ERROR_CHECK(esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M));
-
-    for (int i = 0; g_wifi_connect_status; i++) {
-        esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_STA, &null_data, sizeof(wifi_null_data_t), true);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "esp_wifi_80211_tx, %s", esp_err_to_name(ret));
-            vTaskDelay(pdMS_TO_TICKS(1000));
+    wifi_null_data_t null_data = { .frame_control = {0x48, 0x01} };
+    bool ping_started = false;
+    csi_trigger_mode_t active_mode = (csi_trigger_mode_t)-1;
+    while (g_wifi_connect_status) {
+        if (g_trigger_mode == CSI_TRIGGER_NULL_DATA) {
+            if (ping_started && g_ping_handle != NULL) {
+                esp_ping_stop(g_ping_handle);
+                esp_ping_delete_session(g_ping_handle);
+                g_ping_handle = NULL;
+                ping_started = false;
+            }
+            if (active_mode != CSI_TRIGGER_NULL_DATA) {
+                esp_radar_config_t radar_config = {0};
+                wifi_ap_record_t ap_info = {0};
+                uint8_t sta_mac[6] = {0};
+                esp_radar_get_config(&radar_config);
+                esp_wifi_sta_get_ap_info(&ap_info);
+                ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, sta_mac));
+                memset(radar_config.csi_config.filter_mac, 0, sizeof(radar_config.csi_config.filter_mac));
+                memcpy(radar_config.csi_config.filter_dmac, sta_mac, sizeof(sta_mac));
+                radar_config.csi_config.csi_recv_interval = g_send_data_interval;
+                radar_config.csi_config.dump_ack_en = true;
+                esp_radar_change_config(&radar_config);
+                memcpy(null_data.destination_address, ap_info.bssid, 6);
+                memcpy(null_data.broadcast_address, ap_info.bssid, 6);
+                memcpy(null_data.source_address, sta_mac, 6);
+                ESP_ERROR_CHECK(esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M));
+                ESP_LOGI(TAG, "CSI trigger mode active: null_data");
+                active_mode = CSI_TRIGGER_NULL_DATA;
+            }
+            esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_STA, &null_data, sizeof(null_data), true);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "esp_wifi_80211_tx, %s", esp_err_to_name(ret));
+            }
+            vTaskDelay(pdMS_TO_TICKS(g_send_data_interval));
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(g_send_data_interval));
+        if (!ping_started) {
+            esp_radar_config_t radar_config = {0};
+            wifi_ap_record_t ap_info = {0};
+            esp_netif_ip_info_t local_ip = {0};
+            esp_radar_get_config(&radar_config);
+            esp_wifi_sta_get_ap_info(&ap_info);
+            memset(radar_config.csi_config.filter_mac, 0, sizeof(radar_config.csi_config.filter_mac));
+            radar_config.csi_config.csi_recv_interval = g_send_data_interval;
+            esp_radar_change_config(&radar_config);
+            esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &local_ip);
+            esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
+            config.count = 0;
+            config.data_size = 1;
+            config.interval_ms = g_send_data_interval;
+            config.target_addr.u_addr.ip4.addr = ip4_addr_get_u32(&local_ip.gw);
+            config.target_addr.type = ESP_IPADDR_TYPE_V4;
+            esp_ping_callbacks_t cbs = {0};
+            esp_ping_new_session(&config, &cbs, &g_ping_handle);
+            esp_ping_start(g_ping_handle);
+            ping_started = true;
+            active_mode = CSI_TRIGGER_ROUTER_PING;
+            ESP_LOGI(TAG, "CSI trigger mode active: router_ping, gateway=" IPSTR, IP2STR(&local_ip.gw));
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
-
-#else
-    ESP_LOGI(TAG, "Send ping data to router");
-
-    memcpy(radar_config.csi_config.filter_mac, ap_info.bssid, sizeof(radar_config.csi_config.filter_mac));
-    esp_radar_change_config(&radar_config);
-
-    /* stop and delete existing ping session if any */
     if (g_ping_handle != NULL) {
-        ESP_LOGI(TAG, "Stopping existing ping session before starting new one");
         esp_ping_stop(g_ping_handle);
         esp_ping_delete_session(g_ping_handle);
         g_ping_handle = NULL;
-        ESP_LOGI(TAG, "Existing ping session stopped and deleted");
     }
-
-    esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
-    config.count       = 0;
-    config.data_size   = 1;
-    config.interval_ms = g_send_data_interval;
-
-    /**
-     * @brief Get the Router IP information from the esp-netif
-     */
-    esp_netif_ip_info_t local_ip;
-    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &local_ip);
-    ESP_LOGI(TAG, "Ping: got ip:" IPSTR ", gw: " IPSTR, IP2STR(&local_ip.ip), IP2STR(&local_ip.gw));
-    config.target_addr.u_addr.ip4.addr = ip4_addr_get_u32(&local_ip.gw);
-    config.target_addr.type = ESP_IPADDR_TYPE_V4;
-
-    esp_ping_callbacks_t cbs = { 0 };
-    esp_ping_new_session(&config, &cbs, &g_ping_handle);
-    esp_ping_start(g_ping_handle);
-#endif
-
+    g_trigger_task_handle = NULL;
     vTaskDelete(NULL);
+#else
+    g_trigger_task_handle = NULL;
+    vTaskDelete(NULL);
+#endif
+}
+
+static void print_device_info(const ip_event_got_ip_t *event)
+{
+    wifi_config_t wifi_config = {0};
+    esp_chip_info_t chip_info = {0};
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    char ssid[sizeof(wifi_config.sta.ssid) + 1] = {0};
+
+    ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
+    memcpy(ssid, wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid));
+    esp_chip_info(&chip_info);
+
+    printf("DEVICE_INFO,%u,\"%s %s\",ESP32-S3,%u,%s,%s,%u,%u,\"%s\"," IPSTR ",0\n",
+           esp_log_timestamp(), __DATE__, __TIME__, chip_info.revision,
+           app_desc ? app_desc->version : "unknown",
+           app_desc ? app_desc->idf_ver : "unknown",
+           heap_caps_get_total_size(MALLOC_CAP_DEFAULT), esp_get_free_heap_size(), ssid,
+           IP2STR(&event->ip_info.ip));
 }
 
 /* Event handler for catching system events */
@@ -766,9 +835,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 {
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         g_wifi_connect_status = true;
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Wi-Fi got IP: " IPSTR ", gateway: " IPSTR,
+                 IP2STR(&event->ip_info.ip), IP2STR(&event->ip_info.gw));
+        print_device_info(event);
 
 #if !CONFIG_RESEARCH_RX_ESPNOW_MODE
-        xTaskCreate(trigger_router_send_data_task, "trigger_router_send_data", 4 * 1024, NULL, 5, NULL);
+        ensure_trigger_task();
 #else
         ESP_LOGI(TAG, "Research ESP-NOW RX mode: preserving source MAC filter 1a:00:00:00:00:00");
 #endif
@@ -778,11 +851,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 #endif
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         g_wifi_connect_status = false;
-        ESP_LOGW(TAG, "Wi-Fi disconnected");
-        esp_radar_config_t radar_config;
-        esp_radar_get_config(&radar_config);
-        esp_radar_wifi_reinit(&radar_config.wifi_config);
-
+        wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d", event ? (int)event->reason : -1);
     }
 }
 esp_err_t ws2812_led_init(void)
@@ -865,12 +935,15 @@ void app_main(void)
     esp_radar_csi_config_t csi_config = ESP_RADAR_CSI_CONFIG_DEFAULT();
     esp_radar_wifi_config_t wifi_config = ESP_RADAR_WIFI_CONFIG_DEFAULT();
     esp_radar_dec_config_t dec_config = ESP_RADAR_DEC_CONFIG_DEFAULT();
+#if WIFI_CSI_SEND_NULL_DATA_ENABLE
+    /* Null-data replies are MAC ACK frames, not packets from a fixed peer. */
+    memset(csi_config.filter_mac, 0, sizeof(csi_config.filter_mac));
+    csi_config.dump_ack_en       = true;
+#else
     memcpy(csi_config.filter_mac, "\x1a\x00\x00\x00\x00\x00", 6);
+#endif
     csi_config.csi_recv_interval = g_send_data_interval;
     dec_config.wifi_radar_cb     = wifi_radar_cb;
-#if WIFI_CSI_SEND_NULL_DATA_ENABLE
-    csi_config.dump_ack_en       = true;
-#endif
     dec_config.outliers_threshold = 0;
     ESP_ERROR_CHECK(esp_radar_wifi_init(&wifi_config));
     ESP_ERROR_CHECK(esp_radar_csi_init(&csi_config));
@@ -895,6 +968,6 @@ void app_main(void)
      * @brief Initialize CSI serial port printing task, Use tasks to avoid blocking wifi_csi_raw_cb
      */
     g_csi_info_queue = xQueueCreate(64, sizeof(void *));
-    xTaskCreate(csi_data_print_task, "csi_data_print", 4 * 1024, NULL, 0, NULL);
+    xTaskCreate(csi_data_print_task, "csi_data_print", 4 * 1024, NULL, 4, NULL);
     xTaskCreate(system_telemetry_task, "system_telemetry", 3 * 1024, NULL, 1, NULL);
 }

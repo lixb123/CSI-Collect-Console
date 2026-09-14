@@ -4,6 +4,7 @@
  */
 
 #include <inttypes.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,8 +23,11 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_wifi_ap_get_sta_list.h"
 #include "nvs_flash.h"
 #include "research_protocol.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || \
         (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
@@ -40,16 +44,77 @@
 #define CONFIG_ESP_NOW_RATE WIFI_PHY_RATE_MCS0_LGI
 #define SEND_CALLBACK_TIMEOUT_MS 2000
 #define TX_TASK_STACK_SIZE 4096
+#define SOFTAP_UDP_PORT 3233
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
 
+#if !CONFIG_RESEARCH_TX_SOFTAP_MODE
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t BROADCAST_MAC[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+#endif
 static const char *TAG = "research_tx";
 #define PHYSICS_PROBE_MAGIC 0x31595048u /* "HPY1" little-endian */
 
+#if CONFIG_RESEARCH_TX_SOFTAP_MODE
+static void softap_udp_task(void *arg)
+{
+    (void)arg;
+    uint8_t payload[CONFIG_RESEARCH_TX_PAYLOAD_LENGTH > 0 ? CONFIG_RESEARCH_TX_PAYLOAD_LENGTH : 1] = {0};
+    uint32_t sequence = 0;
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "SoftAP UDP socket creation failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    esp_netif_ip_info_t ip_info = {0};
+    if (!ap_netif || esp_netif_get_ip_info(ap_netif, &ip_info) != ESP_OK) {
+        ESP_LOGE(TAG, "SoftAP IP information is unavailable");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "SoftAP UDP trigger port=%d interval=%dms payload=%d",
+             SOFTAP_UDP_PORT, CONFIG_RESEARCH_TX_SEND_INTERVAL_MS,
+             CONFIG_RESEARCH_TX_PAYLOAD_LENGTH);
+
+    while (true) {
+        wifi_sta_list_t stations = {0};
+        wifi_sta_mac_ip_list_t station_ips = {0};
+        bool have_station = esp_wifi_ap_get_sta_list(&stations) == ESP_OK &&
+                             stations.num > 0 &&
+                             esp_wifi_ap_get_sta_list_with_ip(&stations, &station_ips) == ESP_OK &&
+                             station_ips.num > 0;
+        if (!have_station) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        struct sockaddr_in destination = {
+            .sin_family = AF_INET,
+            .sin_port = htons(SOFTAP_UDP_PORT),
+            .sin_addr.s_addr = station_ips.sta[0].ip.addr,
+        };
+        if (CONFIG_RESEARCH_TX_PAYLOAD_LENGTH >= sizeof(sequence)) {
+            memcpy(payload, &sequence, sizeof(sequence));
+        }
+        int result = sendto(sock, payload, CONFIG_RESEARCH_TX_PAYLOAD_LENGTH,
+                            0, (struct sockaddr *)&destination, sizeof(destination));
+        if (result < 0) {
+            ESP_LOGW(TAG, "SoftAP UDP send failed: errno=%d", errno);
+        }
+        sequence++;
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_RESEARCH_TX_SEND_INTERVAL_MS));
+    }
+}
+#endif
+
+#if !CONFIG_RESEARCH_TX_SOFTAP_MODE
 typedef struct {
     char experiment_id[RESEARCH_EXPERIMENT_ID_LEN];
     uint32_t interval_ms;
@@ -127,10 +192,23 @@ static void print_tx_telemetry(void)
            state.orphan_callbacks, state.bytes_accepted,
            esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
 }
+#endif
 
 static void telemetry_task(void *arg)
 {
     (void)arg;
+#if CONFIG_RESEARCH_TX_SOFTAP_MODE
+    printf("type,device_uptime_ms,role,connected_stations,free_heap,minimum_free_heap\n");
+    while (true) {
+        wifi_sta_list_t stations = {0};
+        esp_err_t result = esp_wifi_ap_get_sta_list(&stations);
+        printf("TX_SOFTAP_TELEMETRY,%" PRIu32 ",softap,%u,%" PRIu32 ",%" PRIu32 "\n",
+               (uint32_t)(esp_timer_get_time() / 1000),
+               result == ESP_OK ? stations.num : 0,
+               esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#else
     printf("type,device_uptime_ms,experiment_id,experiment_hash,running,send_interval_ms,payload_length,"
            "next_seq,attempted,accepted,immediate_errors,callback_success,callback_fail,callback_timeouts,"
            "orphan_callbacks,bytes_accepted,free_heap,minimum_free_heap\n");
@@ -138,8 +216,10 @@ static void telemetry_task(void *arg)
         print_tx_telemetry();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+#endif
 }
 
+#if !CONFIG_RESEARCH_TX_SOFTAP_MODE
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 #else
@@ -249,13 +329,41 @@ static void transmitter_task(void *arg)
         }
     }
 }
+#endif
 
 static void wifi_init(void)
 {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_netif_init());
+#if CONFIG_RESEARCH_TX_SOFTAP_MODE
+    esp_netif_create_default_wifi_ap();
+#endif
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+#if CONFIG_RESEARCH_TX_SOFTAP_MODE
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    wifi_config_t ap_config = {0};
+    strlcpy((char *)ap_config.ap.ssid, CONFIG_RESEARCH_TX_SOFTAP_SSID,
+            sizeof(ap_config.ap.ssid));
+    strlcpy((char *)ap_config.ap.password, CONFIG_RESEARCH_TX_SOFTAP_PASSWORD,
+            sizeof(ap_config.ap.password));
+    ap_config.ap.ssid_len = strnlen((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid));
+    ap_config.ap.channel = CONFIG_RESEARCH_TX_CHANNEL;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = strlen(CONFIG_RESEARCH_TX_SOFTAP_PASSWORD) >= 8 ?
+        WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    if (ap_config.ap.authmode == WIFI_AUTH_OPEN) {
+        ESP_LOGW(TAG, "SoftAP password is shorter than 8 characters; using open authentication");
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20));
+    ESP_LOGI(TAG, "SoftAP SSID=%s channel=%d auth=%s",
+             CONFIG_RESEARCH_TX_SOFTAP_SSID, CONFIG_RESEARCH_TX_CHANNEL,
+             ap_config.ap.authmode == WIFI_AUTH_OPEN ? "open" : "WPA2-PSK");
+#else
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
@@ -292,8 +400,10 @@ static void wifi_init(void)
 #endif
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_RESEARCH_TX_CHANNEL, secondary));
     ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+#endif
 }
 
+#if !CONFIG_RESEARCH_TX_SOFTAP_MODE
 static void espnow_init(void)
 {
     ESP_ERROR_CHECK(esp_now_init());
@@ -317,7 +427,9 @@ static void espnow_init(void)
     ESP_ERROR_CHECK(esp_now_set_peer_rate_config(peer.peer_addr, &rate_config));
 #endif
 }
+#endif
 
+#if !CONFIG_RESEARCH_TX_SOFTAP_MODE
 static int research_tx_command(int argc, char **argv)
 {
     int errors = arg_parse(argc, argv, (void **)&tx_args);
@@ -390,6 +502,7 @@ static void register_research_tx_command(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&command));
 }
+#endif
 
 static void console_init(void)
 {
@@ -398,7 +511,9 @@ static void console_init(void)
     repl_config.prompt = "research-tx>";
     repl_config.max_cmdline_length = 256;
     esp_console_register_help_command();
+#if !CONFIG_RESEARCH_TX_SOFTAP_MODE
     register_research_tx_command();
+#endif
 
 #if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) || defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
@@ -423,14 +538,28 @@ void app_main(void)
         result = nvs_flash_init();
     }
     ESP_ERROR_CHECK(result);
+#if !CONFIG_RESEARCH_TX_SOFTAP_MODE
     if (!research_experiment_id_valid(g_tx.experiment_id)) {
         ESP_LOGE(TAG, "Invalid default experiment ID: %s", g_tx.experiment_id);
         g_tx.running = false;
     }
+#endif
 
     wifi_init();
+#if !CONFIG_RESEARCH_TX_SOFTAP_MODE
     espnow_init();
+#endif
     const esp_app_desc_t *app = esp_app_get_description();
+#if CONFIG_RESEARCH_TX_SOFTAP_MODE
+    uint8_t ap_mac[6] = {0};
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_AP, ap_mac));
+    printf("TX_DEVICE_INFO,softap,%s,%s,%s %s," MACSTR ",%d\n",
+           app->version, esp_get_idf_version(), app->date, app->time,
+           MAC2STR(ap_mac), CONFIG_RESEARCH_TX_CHANNEL);
+    ESP_LOGI(TAG, "SoftAP CSI transmitter SSID=%s channel=%d bssid=" MACSTR,
+             CONFIG_RESEARCH_TX_SOFTAP_SSID, CONFIG_RESEARCH_TX_CHANNEL,
+             MAC2STR(ap_mac));
+#else
     printf("TX_DEVICE_INFO,%s,%s,%s %s," MACSTR ",%d\n",
            app->version, esp_get_idf_version(), app->date, app->time,
            MAC2STR(CONFIG_CSI_SEND_MAC), CONFIG_RESEARCH_TX_CHANNEL);
@@ -438,8 +567,13 @@ void app_main(void)
              g_tx.experiment_id, g_tx.interval_ms, g_tx.payload_length,
              CONFIG_RESEARCH_TX_CHANNEL, MAC2STR(CONFIG_CSI_SEND_MAC));
     ESP_LOGW(TAG, "ESP-NOW callback success is local MAC status, not receiver delivery proof");
+#endif
 
     console_init();
+#if CONFIG_RESEARCH_TX_SOFTAP_MODE
+    xTaskCreate(softap_udp_task, "softap_udp", 3072, NULL, 5, NULL);
+#else
     xTaskCreate(transmitter_task, "research_tx", TX_TASK_STACK_SIZE, NULL, 5, NULL);
+#endif
     xTaskCreate(telemetry_task, "tx_telemetry", 3072, NULL, 2, NULL);
 }

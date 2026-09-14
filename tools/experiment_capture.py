@@ -171,6 +171,15 @@ def load_experiment_config(path: str | os.PathLike[str] | None) -> dict[str, Any
     interval = safe_int(config.get("send_interval_ms"))
     if interval is not None and interval <= 0:
         raise ValueError("send_interval_ms must be greater than zero")
+    distance_m = config.get("distance_m")
+    if distance_m is not None and safe_text(distance_m):
+        try:
+            distance_m = float(distance_m)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("distance_m must be a number in meters") from exc
+        if distance_m <= 0:
+            raise ValueError("distance_m must be greater than zero")
+        config["distance_m"] = round(distance_m, 2)
     fall_type = safe_text(config.get("fall_type"))
     if fall_type and fall_type not in {"demonstrated_fall", "incident_fall"}:
         raise ValueError("fall_type must be demonstrated_fall or incident_fall")

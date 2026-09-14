@@ -1,5 +1,25 @@
 menu "Research CSI transmitter"
 
+config RESEARCH_TX_SOFTAP_MODE
+    bool "Run as SoftAP CSI transmitter"
+    default y
+    help
+        Build this ESP32-S3 as a Wi-Fi SoftAP instead of an ESP-NOW STA.
+        The existing receiver firmware can connect to this SSID and use its
+        router-ping CSI workflow without a receiver firmware update.
+
+config RESEARCH_TX_SOFTAP_SSID
+    string "SoftAP SSID"
+    default "ESP32S3-CSI-AP"
+    depends on RESEARCH_TX_SOFTAP_MODE
+
+config RESEARCH_TX_SOFTAP_PASSWORD
+    string "SoftAP WPA2 password"
+    default "csi-research"
+    depends on RESEARCH_TX_SOFTAP_MODE
+    help
+        Use at least 8 characters for WPA2. Shorter values create an open AP.
+
 config RESEARCH_TX_EXPERIMENT_ID
     string "Default experiment ID"
     default "UNSET"

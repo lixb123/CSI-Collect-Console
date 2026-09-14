@@ -1,6 +1,7 @@
 # ESP32-S3 研究发射端
 
-`csi_send` 是与 `console-csi-v6` 接收固件配套的 ESP-NOW 研究发射端。它保留固定源 MAC
+`csi_send` 默认编译为接收端无需刷新固件即可连接的 SoftAP CSI 发射端，也保留与
+`console-csi-v6` ESP-NOW 接收固件配套的研究发射角色。ESP-NOW 角色使用固定源 MAC
 `1a:00:00:00:00:00`、默认信道 11，并在每个数据帧中携带可核验的实验元数据。
 
 ## 数据帧
@@ -32,6 +33,19 @@ idf.py -B build-research-s3 -p COM端口 flash monitor
 ```text
 csi_send/build-research-s3/csi_send.bin
 ```
+
+### SoftAP 角色
+
+默认配置已打开 `Run as SoftAP CSI transmitter`。可在 `idf.py menuconfig` 的
+`Research CSI transmitter` 菜单中
+设置 `SoftAP SSID` 和至少 8 个字符的 `SoftAP WPA2 password`，然后重新编译并烧录发射端。
+SoftAP 角色会提供 DHCP，默认网关为 `192.168.4.1`；接收端 GUI 仍使用“Wi-Fi 接入点”区域填写
+SSID 和密码。发射端会按 `RESEARCH_TX_SEND_INTERVAL_MS` 向 SoftAP 子网广播 UDP 触发包（端口
+`3233`），接收端可以从这些连续的 AP 数据帧获取 CSI。SoftAP 角色不会启动 ESP-NOW 发送任务，
+也不要求重新刷写接收端固件。
+
+默认 `10 ms` 间隔对应约 100 次发送/秒，但实际 CSI 速率仍受 Wi-Fi 调度、聚合、信道占用和
+接收端串口带宽影响；若仍需要更高频率，可将间隔改为 `5 ms` 后重新编译发射端。
 
 ## 串口配置
 

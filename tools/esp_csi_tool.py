@@ -20,6 +20,7 @@ import pandas as pd
 import numpy as np
 
 import serial
+from serial.tools import list_ports
 from os import path
 from os import mkdir
 from io import StringIO
@@ -34,6 +35,7 @@ from PyQt5.QtCore import QDate, QDate, QTime, QDateTime
 import threading
 import base64
 import time
+from queue import Empty
 from datetime import datetime
 from multiprocessing import Process, Queue
 
@@ -51,6 +53,67 @@ from experiment_capture import ExperimentLedger, load_experiment_config, sha256_
 
 
 CSI_SAMPLE_RATE = 100
+CSI_DISPLAY_INTERVAL_MS = 100
+CSI_DISPLAY_MAX_POINTS = 250
+
+
+class SerialConnectionController:
+    """Own the serial worker lifecycle while keeping the GUI queues stable."""
+
+    def __init__(self, queue_read, queue_write, csi_output_type, experiment_config, data_root):
+        self.queue_read = queue_read
+        self.queue_write = queue_write
+        self.csi_output_type = csi_output_type
+        self.experiment_config = experiment_config
+        self.data_root = data_root
+        self.process = None
+        self.port = ''
+
+    def is_connected(self):
+        return self.process is not None and self.process.is_alive()
+
+    def start(self, port):
+        port = str(port or '').strip()
+        if not port:
+            return False
+        if self.is_connected():
+            return True
+        try:
+            probe = serial.Serial(port=port, baudrate=2000000, timeout=0)
+            probe.close()
+        except Exception as exc:
+            self.queue_read.put(pd.Series(
+                index=['type', 'tag', 'timestamp', 'data'],
+                data=['LOG_DATA', 'E', '串口', f'无法打开串口 {port}：{exc}']))
+            return False
+        self.port = port
+        self.process = Process(
+            target=serial_handle,
+            args=(self.queue_read, self.queue_write, port,
+                  self.experiment_config, self.data_root),
+        )
+        self.process.start()
+        return True
+
+    def stop(self):
+        process = self.process
+        if process is None:
+            return
+        if process.is_alive():
+            self.queue_write.put('exit')
+            process.join(timeout=5)
+        if process.is_alive():
+            print('WARNING: serial worker did not stop within 5 seconds; terminating it')
+            process.terminate()
+            process.join(timeout=2)
+        self.process = None
+
+    def discard_pending_commands(self):
+        while True:
+            try:
+                self.queue_write.get_nowait()
+            except Exception:
+                break
 
 # Remove invalid subcarriers
 # secondary channel : below, HT, 40 MHz, non STBC, v, HT-LTF: 0~63, -64~-1, 384
@@ -156,6 +219,7 @@ RADAR_DATA_COLUMNS_NAMES = ['type', 'seq', 'timestamp',
 g_csi_amplitude_array = np.zeros(
     [CSI_DATA_INDEX, CSI_DATA_COLUMNS], dtype=np.int32)
 g_rssi_array = np.zeros(CSI_DATA_INDEX, dtype=np.int8)
+g_csi_update_counter = 0
 # 使用 object 类型以支持混合数据类型（字符串、数字、时间戳等）
 g_radio_header_pd = pd.DataFrame(np.empty([10, len(
     CSI_DATA_COLUMNS_NAMES[1:-1])], dtype=object), columns=CSI_DATA_COLUMNS_NAMES[1:-1])
@@ -194,7 +258,7 @@ g_evaluate_statistics_array = np.zeros(
     [RADAR_targetS_LEN, RADAR_targetS_LEN], dtype=np.int32)
 
 g_display_raw_data = False
-g_display_radar_model = False
+g_display_radar_model = True
 g_display_eigenvalues_table = False
 
 def base64_decode_bin(str_data):
@@ -302,9 +366,16 @@ def evaluate_data_send(serial_queue_write, folder_path):
 
 
 class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
-    def __init__(self, serial_queue_write, csi_output_type='LLTF', experiment_config=None, data_root='data', parent=None):
+    def __init__(self, serial_controller, csi_output_type='LLTF', experiment_config=None,
+                 data_root='data', initial_port=None, parent=None):
         super(DataGraphicalWindow, self).__init__(parent)
         self.setupUi(self)
+        self._arrange_collection_metadata()
+        self._arrange_collection_controls()
+        self._arrange_radar_controls()
+        self._detach_collection_panel()
+        self._arrange_display_panels()
+        self._configure_connection_inputs()
         self.gui_config_path = Path('./config/gui_config.json')
         try:
             self.gui_config = json.loads(self.gui_config_path.read_text(encoding='utf-8'))
@@ -318,7 +389,10 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             self.gui_config_path.write_text(
                 json.dumps(self.gui_config, ensure_ascii=False, indent=2), encoding='utf-8'
             )
-        self.language = self.gui_config.get('language', 'zh')
+        self.language = self.gui_config.get('language', 'en')
+        self.serial_controller = serial_controller
+        self.serial_queue_write = serial_controller.queue_write
+        self._initial_serial_port = initial_port or self.gui_config.get('serial_port', '')
         for index, (command, label) in enumerate(COMMAND_OPTIONS):
             self.comboBox_command.setItemText(index, label)
             self.comboBox_command.setItemData(index, command)
@@ -333,12 +407,14 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.data_root = data_root
         participant_id = ''
         room_id = ''
+        receiver_id = ''
         if self.experiment_config:
             participant_id = str(self.experiment_config.get('participant_id', ''))
             room_id = str(self.experiment_config.get('room_id', ''))
+            receiver_id = str(self.experiment_config.get('receiver_id', ''))
             self.setWindowTitle(
                 f"ESP CSI 研究采集 - {self.experiment_config['session_id']} - "
-                f"{participant_id} - {room_id}"
+                f"{participant_id} - {room_id} - {receiver_id}"
             )
             self.pushButton_collect_clean.setEnabled(False)
             self.pushButton_collect_clean.setToolTip(
@@ -346,11 +422,23 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             )
         self.lineEdit_participant_id.setText(participant_id)
         self.lineEdit_room_id.setText(room_id)
+        self.lineEdit_receiver_id.setText(receiver_id)
+        configured_distance = (self.experiment_config or {}).get(
+            'distance_m', self.gui_config.get('distance_m', 0.0))
+        try:
+            self.doubleSpinBox_tx_rx_distance.setValue(max(0.0, float(configured_distance)))
+        except (TypeError, ValueError):
+            self.doubleSpinBox_tx_rx_distance.setValue(0.0)
         self.lineEdit_participant_id.setAccessibleName('人员标签 participant_id')
         self.lineEdit_room_id.setAccessibleName('地点标签 room_id')
+        self.lineEdit_receiver_id.setAccessibleName('设备标签 receiver_id')
+        self.comboBox_send_mode.setAccessibleName('CSI trigger mode')
         id_validator = QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
         self.lineEdit_participant_id.setValidator(id_validator)
         self.lineEdit_room_id.setValidator(
+            QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
+        )
+        self.lineEdit_receiver_id.setValidator(
             QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
         )
         self.lineEdit_participant_id.setStyleSheet(
@@ -361,6 +449,11 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             'QLineEdit { background-color: #eef9ed; border: 1px solid #5a9f59; '
             'border-radius: 4px; padding: 4px 8px; font-weight: 600; }'
         )
+        self.lineEdit_receiver_id.setStyleSheet(
+            'QLineEdit { background-color: #fff6e5; border: 1px solid #d59b35; '
+            'border-radius: 4px; padding: 4px 8px; font-weight: 600; }'
+        )
+        self.refresh_serial_ports()
         self.label_complex_csi = QLabel(self.groupBox_18)
         self.checkBox_complex_csi = QCheckBox(self.groupBox_18)
         self.checkBox_complex_csi.setChecked(bool(
@@ -412,6 +505,7 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             if not self.experiment_config:
                 self.lineEdit_participant_id.setText(gui_config.get('participant_id', ''))
                 self.lineEdit_room_id.setText(gui_config.get('room_id', ''))
+                self.lineEdit_receiver_id.setText(gui_config.get('receiver_id', ''))
 
             g_display_raw_data = gui_config.get('display_raw_data', True)
             if g_display_raw_data:
@@ -419,6 +513,8 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             else:
                 self.checkBox_raw_data.setChecked(False)
 
+            # Radar is visible on a fresh installation and can be hidden from
+            # the top-level display checkbox without affecting Collection.
             g_display_radar_model = gui_config.get('display_radar_model', True)
             if g_display_radar_model:
                 self.checkBox_radar_model.setChecked(True)
@@ -435,6 +531,10 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                 self.checkBox_router_auto_connect.setChecked(True)
             else:
                 self.checkBox_router_auto_connect.setChecked(False)
+            saved_send_mode = gui_config.get('send_mode', 'router_ping')
+            mode_index = self.comboBox_send_mode.findText(saved_send_mode)
+            if mode_index >= 0:
+                self.comboBox_send_mode.setCurrentIndex(mode_index)
 
         saved_action = gui_config.get('collect_action', 'none')
         saved_action_index = self.comboBox_collect_target.findData(saved_action)
@@ -453,8 +553,6 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.graphicsView_subcarrier.addLegend()
 
         self.curve_subcarrier = []
-        self.serial_queue_write = serial_queue_write
-
         for i in range(CSI_DATA_COLUMNS):
             curve = self.graphicsView_subcarrier.plot(
                 g_csi_amplitude_array[:, i], name=str(i), pen=csi_vaid_subcarrier_color[i])
@@ -464,6 +562,9 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             g_rssi_array, name='rssi', pen=(255, 255, 255))
 
         self.wave_filtering_flag = self.checkBox_wave_filtering.isCheckable()
+        self._filter_coefficients = signal.butter(
+            8, 20 / (CSI_SAMPLE_RATE / 2), 'lowpass')
+        self._last_csi_update_counter = -1
         self.checkBox_wave_filtering.released.connect(
             self.show_curve_subcarrier_filter)
         # self.graphicsView_rssi.setYRange(-10, -65)
@@ -563,6 +664,11 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
 
         self.pushButton_router_connect.released.connect(
             self.command_router_connect)
+        self.comboBox_send_mode.currentTextChanged.connect(self.command_send_mode)
+        self.pushButton_serial_connect.released.connect(self.toggle_serial_connection)
+        self.comboBox_serial_port.currentTextChanged.connect(self.save_serial_port)
+        self.pushButton_serial_refresh.released.connect(self.refresh_serial_ports)
+        self.doubleSpinBox_tx_rx_distance.valueChanged.connect(self.save_tx_rx_distance)
         self.pushButton_command.released.connect(self.command_custom)
 
         self.comboBox_command.activated.connect(self.comboBox_command_show)
@@ -602,11 +708,13 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.timer_boot_command = QTimer()
         self.timer_boot_command.timeout.connect(self.command_boot)
         self.timer_boot_command.setInterval(3000)
-        self.timer_boot_command.start()
+        self.boot_command_attempts = 0
+        # The serial worker is started by the COM-port button.  This timer is
+        # started after a successful connection in toggle_serial_connection().
 
         self.timer_curve_subcarrier = QTimer()
         self.timer_curve_subcarrier.timeout.connect(self.show_curve_subcarrier)
-        self.timer_curve_subcarrier.setInterval(300)
+        self.timer_curve_subcarrier.setInterval(CSI_DISPLAY_INTERVAL_MS)
 
         self.timer_curve_radar = QTimer()
         self.timer_curve_radar.timeout.connect(self.show_curve_eigenvalue)
@@ -658,9 +766,227 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.checkBox_radar_model_show()
         self.checkBox_display_eigenvalues_table_show()
         self.apply_language()
+        self.update_serial_connection_ui()
 
     def tr_text(self, zh, en):
         return en if self.language == 'en' else zh
+
+    def _arrange_collection_metadata(self):
+        """Put the three identity fields on separate rows for readable labels."""
+        metadata_layout = self.horizontalLayout_collect_metadata
+        self.verticalLayout_3.removeItem(metadata_layout)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+        fields = (
+            (self.label_participant_id, self.lineEdit_participant_id),
+            (self.label_room_id, self.lineEdit_room_id),
+            (self.label_receiver_id, self.lineEdit_receiver_id),
+        )
+        for row, (label, editor) in enumerate(fields):
+            grid.addWidget(label, row, 0)
+            grid.addWidget(editor, row, 1)
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        self.verticalLayout_3.insertLayout(0, grid)
+        self.collection_metadata_layout = grid
+
+    def _arrange_display_panels(self):
+        """Place Raw data and Collection side by side, with Radar below."""
+        for nested in (self.splitter_3, self.splitter_raw_data):
+            nested.setMinimumWidth(0)
+        # Let the outer splitter decide the radar width; its nested panes have
+        # wide diagnostic controls but should not reserve the whole window.
+        for pane in (self.layoutWidget1, self.layoutWidget2):
+            pane.setMinimumWidth(0)
+            pane.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.groupBox_16.setMinimumWidth(0)
+        self.groupBox_16.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        for pane in (self.groupBox_14, self.groupBox_18):
+            pane.setMinimumWidth(0)
+            pane.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.splitter_display.insertWidget(0, self.groupBox_raw_data)
+        self.splitter_display.insertWidget(1, self.groupBox_18)
+        for pane in (self.groupBox_raw_data, self.groupBox_18):
+            pane.setMinimumWidth(0)
+            pane.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.groupBox_radar_model.setMinimumWidth(0)
+        self.groupBox_radar_model.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.splitter_display.setStretchFactor(0, 1)
+        self.splitter_display.setStretchFactor(1, 1)
+        self.centralwidget.layout().addWidget(self.groupBox_radar_model)
+        QTimer.singleShot(0, self._apply_default_display_sizes)
+
+    def _detach_collection_panel(self):
+        """Move Collection out of Radar so it remains visible independently."""
+        radar_layout = self.layoutWidget2.layout()
+        if radar_layout is not None:
+            radar_layout.removeWidget(self.groupBox_18)
+        self.groupBox_18.setParent(self.centralwidget)
+        self.groupBox_18.setTitle('Collection')
+        self.layoutWidget2.hide()
+        self.splitter_3.setSizes([1, 1, 0])
+
+    def _arrange_radar_controls(self):
+        """Use two compact rows so the Raw data panel can keep most width."""
+        control_widget = self.widget_31
+        old_layout = control_widget.layout()
+        if old_layout is None:
+            return
+        widgets = [old_layout.itemAt(i).widget() for i in range(old_layout.count())]
+        widgets = [widget for widget in widgets if widget is not None]
+        for widget in widgets:
+            old_layout.removeWidget(widget)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        pairs = [
+            (self.label_number_3, self.doubleSpinBox_predict_someone_sensitivity),
+            (self.label_number_5, self.doubleSpinBox_predict_move_sensitivity),
+        ]
+        for column, (label, editor) in enumerate(pairs):
+            grid.addWidget(label, 0, column * 2)
+            grid.addWidget(editor, 0, column * 2 + 1)
+        grid.addWidget(self.label_duration_7, 1, 0)
+        grid.addWidget(self.spinBox_predict_buffer_size, 1, 1)
+        grid.addWidget(self.spinBox_predict_outliers_number, 1, 3)
+        grid.addWidget(self.checkBox_display_eigenvalues_table, 2, 0, 1, 2)
+        grid.addWidget(self.pushButton_predict_config, 2, 2, 1, 2)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(5, 1)
+        old_layout.addLayout(grid)
+        self.radar_controls_layout = grid
+
+    def _arrange_collection_controls(self):
+        """Wrap collection action, timing and trial controls into readable rows."""
+        controls_layout = self.horizontalLayout_9
+        self.verticalLayout_3.removeItem(controls_layout)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+        grid.addWidget(self.label_target_4, 0, 0)
+        grid.addWidget(self.comboBox_collect_target, 0, 1, 1, 3)
+        grid.addWidget(self.label_delay, 1, 0)
+        grid.addWidget(self.timeEdit_collect_delay, 1, 1)
+        grid.addWidget(self.label_duration, 1, 2)
+        grid.addWidget(self.spinBox_collect_duration, 1, 3)
+        grid.addWidget(self.label_number, 2, 0)
+        grid.addWidget(self.spinBox_collect_number, 2, 1)
+        grid.addWidget(self.pushButton_collect_clean, 2, 2)
+        grid.addWidget(self.pushButton_collect_start, 2, 3)
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 0)
+        grid.setColumnStretch(3, 1)
+        self.verticalLayout_3.insertLayout(1, grid)
+        self.collection_controls_layout = grid
+
+    def _apply_default_display_sizes(self):
+        total_width = max(self.splitter_display.width(), 900)
+        self.splitter_display.setSizes([
+            total_width // 2,
+            total_width - (total_width // 2),
+        ])
+
+    def _configure_connection_inputs(self):
+        """Reserve enough width for long SSIDs, passwords and port names."""
+        for widget in (self.lineEdit_router_ssid, self.lineEdit_router_password):
+            widget.setMinimumWidth(220)
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            widget.setClearButtonEnabled(True)
+        self.horizontalLayout_13.setColumnStretch(0, 0)
+        self.horizontalLayout_13.setColumnStretch(1, 1)
+        self.horizontalLayout_13.setColumnStretch(2, 0)
+        self.horizontalLayout_13.setColumnStretch(3, 1)
+        self.comboBox_serial_port.setMinimumWidth(180)
+
+    def refresh_serial_ports(self):
+        """Refresh detected ports while preserving a saved or typed port."""
+        saved_port = str(
+            self.serial_controller.port or self.selected_serial_port()
+            or self._initial_serial_port or self.gui_config.get('serial_port', '')
+        ).strip()
+        detected = []
+        try:
+            detected = sorted(list_ports.comports(), key=lambda item: item.device)
+        except Exception as exc:
+            self.show_textBrowser_log(f'<font color="yellow">无法枚举串口：{exc}</font>')
+
+        self.comboBox_serial_port.blockSignals(True)
+        self.comboBox_serial_port.clear()
+        for port_info in detected:
+            label = port_info.device
+            description = str(port_info.description or '').strip()
+            if description and description.lower() != 'n/a':
+                label = f'{port_info.device} - {description}'
+            self.comboBox_serial_port.addItem(label, port_info.device)
+        self.comboBox_serial_port.blockSignals(False)
+
+        if saved_port:
+            index = self.comboBox_serial_port.findData(saved_port)
+            if index >= 0:
+                self.comboBox_serial_port.setCurrentIndex(index)
+            else:
+                self.comboBox_serial_port.setEditText(saved_port)
+        elif not detected:
+            self.comboBox_serial_port.setEditText('')
+
+    def selected_serial_port(self):
+        port = self.comboBox_serial_port.currentData()
+        if not port:
+            port = self.comboBox_serial_port.currentText()
+        return str(port or '').strip().split(' - ', 1)[0]
+
+    def save_serial_port(self, _text=None):
+        port = self.selected_serial_port()
+        if port:
+            self.save_gui_config(serial_port=port)
+
+    def save_tx_rx_distance(self, value):
+        self.save_gui_config(distance_m=round(float(value), 2))
+
+    def update_serial_connection_ui(self, status=None):
+        connected = self.serial_controller.is_connected()
+        port = self.serial_controller.port or self.selected_serial_port()
+        if connected:
+            self.label_serial_status.setText(
+                self.tr_text(f'已连接：{port}', f'Connected: {port}'))
+            self.label_serial_status.setStyleSheet('color: green; font-weight: 600;')
+            self.pushButton_serial_connect.setText(self.tr_text('断开', 'Disconnect'))
+            self.pushButton_serial_connect.setStyleSheet('color: red;')
+            self.comboBox_serial_port.setEnabled(False)
+        else:
+            self.label_serial_status.setText(
+                status or self.tr_text('未连接', 'Disconnected'))
+            self.label_serial_status.setStyleSheet('color: #666;')
+            self.pushButton_serial_connect.setText(self.tr_text('连接', 'Connect'))
+            self.pushButton_serial_connect.setStyleSheet('color: black;')
+            self.comboBox_serial_port.setEnabled(True)
+
+    def toggle_serial_connection(self):
+        if self.serial_controller.is_connected():
+            self.finish_collection(send_stop=True)
+            self.timer_boot_command.stop()
+            self.serial_controller.stop()
+            self.update_serial_connection_ui()
+            return
+
+        port = self.selected_serial_port()
+        if not port:
+            QMessageBox.warning(self, self.tr_text('串口缺失', 'Serial port missing'),
+                                 self.tr_text('请选择或输入 ESP32 的 COM 端口。',
+                                              'Select or enter the ESP32 COM port.'))
+            return
+        self.save_serial_port(port)
+        if not self.serial_controller.start(port):
+            self.update_serial_connection_ui(self.tr_text('连接失败', 'Connection failed'))
+            return
+        self.update_serial_connection_ui()
+        self.boot_command_attempts = 0
+        self.command_boot()
+        self.timer_boot_command.start()
+
 
     def save_gui_config(self, **updates):
         self.gui_config.update(updates)
@@ -683,8 +1009,9 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.checkBox_raw_data.setText('Raw data' if en else '原始数据')
         self.checkBox_radar_model.setText('Radar model' if en else '雷达模型')
         self.groupBox_16.setTitle('Device commands' if en else '设备命令')
-        self.groupBox_11.setTitle('Router' if en else '路由器')
+        self.groupBox_11.setTitle('Wi-Fi access point (router / ESP32 SoftAP)' if en else 'Wi-Fi 接入点（路由器 / ESP32 SoftAP）')
         self.label_duration_2.setText('Password' if en else '密码')
+        self.label_send_mode.setText('Trigger' if en else '触发方式')
         self.checkBox_router_auto_connect.setText('Auto connect' if en else '自动连接')
         self.label.setText('Custom command' if en else '自定义命令')
         self.groupBox_13.setTitle('Runtime log' if en else '运行日志')
@@ -705,9 +1032,11 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.label_delay_9.setText('Time' if en else '时间')
         self.checkBox_statistics_auto_update.setText('Auto update' if en else '自动更新')
         self.pushButton_statistics_config.setText('Update' if en else '更新')
-        self.groupBox_18.setTitle('Collection controls and experiment labels' if en else '采集控制与实验标签')
+        self.groupBox_18.setTitle('Collection' if en else '采集')
         self.label_participant_id.setText('Participant label (participant_id)' if en else '人员标签（participant_id）')
         self.label_room_id.setText('Location label (room_id)' if en else '地点标签（room_id）')
+        self.label_receiver_id.setText('Device label (receiver_id)' if en else '设备标签（receiver_id）')
+        self.label_tx_rx_distance.setText('Tx_Rx_Dis (m)' if en else 'Tx_Rx_Dis（米）')
         self.label_complex_csi.setText('Physics CSI' if en else '物理 CSI')
         self.checkBox_complex_csi.setText('Save complex I/Q' if en else '保存复数 I/Q')
         role = self.comboBox_calibration_role.currentData()
@@ -739,6 +1068,8 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             self.comboBox_statistics_mode.setItemText(index, label)
         self.lineEdit_participant_id.setPlaceholderText('e.g. P001' if en else '例如 P001')
         self.lineEdit_room_id.setPlaceholderText('e.g. R01 / LAB-A' if en else '例如 R01 / LAB-A')
+        self.lineEdit_receiver_id.setPlaceholderText('e.g. ESP32-RX-01' if en else '例如 ESP32-RX-01')
+        self.doubleSpinBox_tx_rx_distance.setSuffix(' m')
         collecting = self.pushButton_collect_start.text() in {'停止', 'Stop'}
         self.pushButton_collect_start.setText(('Stop' if en else '停止') if collecting else ('Start' if en else '开始'))
         self.pushButton_collect_clean.setText('Clear data' if en else '清空数据')
@@ -747,6 +1078,17 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.pushButton_router_connect.setText(
             ('Disconnect' if en else '断开') if router_connected else ('Connect' if en else '连接')
         )
+        serial_connected = self.serial_controller.is_connected()
+        self.label_serial_port.setText('COM port' if en else 'COM 端口')
+        self.pushButton_serial_refresh.setText('Refresh' if en else '刷新')
+        self.pushButton_serial_refresh.setToolTip(
+            'Rescan available COM ports.' if en else '重新扫描当前可用的 COM 串口。'
+        )
+        self.pushButton_serial_connect.setText(
+            ('Disconnect' if en else '断开') if serial_connected else
+            ('Connect' if en else '连接')
+        )
+        self.update_serial_connection_ui()
         training = self.pushButton_train_start.text() in {'停止', 'Stop'}
         self.pushButton_train_start.setText(
             ('Stop' if en else '停止') if training else ('Start' if en else '开始')
@@ -776,10 +1118,12 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
 
         if self.checkBox_raw_data.isChecked():
             self.groupBox_raw_data.show()
-            self.timer_curve_subcarrier.start()
         else:
             self.groupBox_raw_data.hide()
-            self.timer_curve_subcarrier.stop()
+        # Keep the shared RSSI/header refresh active even when the raw plot is
+        # hidden.  Collection and receive metadata must not depend on a view
+        # checkbox.
+        self.timer_curve_subcarrier.start()
 
         self.save_gui_config(display_raw_data=self.checkBox_raw_data.isChecked())
 
@@ -790,10 +1134,14 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
 
         if self.checkBox_radar_model.isChecked():
             self.groupBox_radar_model.show()
+            self.layoutWidget1.show()
+            self.groupBox_19.show()
             self.timer_status_record.start()
             self.timer_curve_radar.start()
         else:
             self.groupBox_radar_model.hide()
+            self.layoutWidget1.hide()
+            self.groupBox_19.hide()
             self.timer_status_record.stop()
             self.timer_curve_radar.stop()
 
@@ -833,14 +1181,24 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         waveform = tmp
 
     def show_curve_subcarrier(self):
-        wn = 20 / (CSI_SAMPLE_RATE / 2)
-        b, a = signal.butter(8, wn, 'lowpass')
+        if self._last_csi_update_counter == g_csi_update_counter:
+            return
+        self._last_csi_update_counter = g_csi_update_counter
+
+        # Keep the full buffer for collection, but only draw the newest points
+        # so a high-rate CSI stream cannot make the GUI redraw 500 samples per
+        # curve on every timer tick.
+        display_slice = slice(-CSI_DISPLAY_MAX_POINTS, None)
+        amplitude_data = g_csi_amplitude_array[display_slice]
+        rssi_data = g_rssi_array[display_slice]
 
         if self.wave_filtering_flag:
-            self.median_filtering(g_csi_amplitude_array)
-            csi_filtfilt_data = signal.filtfilt(b, a, g_csi_amplitude_array.T).T
+            amplitude_data = amplitude_data.copy()
+            self.median_filtering(amplitude_data)
+            b, a = self._filter_coefficients
+            csi_filtfilt_data = signal.filtfilt(b, a, amplitude_data.T, axis=1).T
         else:
-            csi_filtfilt_data = g_csi_amplitude_array
+            csi_filtfilt_data = amplitude_data
 
         if self.curve_subcarrier_range[0] > csi_filtfilt_data.min() or self.curve_subcarrier_range[1] < csi_filtfilt_data.max():
             if csi_filtfilt_data.min() > 0 and self.curve_subcarrier_range[0] > csi_filtfilt_data.min():
@@ -855,14 +1213,13 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
 
         if self.wave_filtering_flag:
             csi_filtfilt_rssi = signal.filtfilt(
-                b, a, g_rssi_array).astype(np.int32)
+                b, a, rssi_data).astype(np.int32)
         else:
-            csi_filtfilt_rssi = g_rssi_array
+            csi_filtfilt_rssi = rssi_data
         self.curve_rssi.setData(csi_filtfilt_rssi)
 
-        for i in range(g_radio_header_pd.shape[0]):
-            for j in range(g_radio_header_pd.shape[1]):
-                cell_value = g_radio_header_pd.iloc[i, j]
+        for j in range(g_radio_header_pd.shape[1]):
+                cell_value = g_radio_header_pd.iloc[0, j]
                 if cell_value is None or (isinstance(cell_value, float) and np.isnan(cell_value)):
                     item = QStandardItem('')
                 elif g_radio_header_pd.columns.values[j] in self.tableView_values.keys():
@@ -874,7 +1231,7 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                 else:
                     # print(j, g_radio_header_pd.columns.values[j])
                     item = QStandardItem(str(cell_value) if cell_value is not None else '')
-                self.model_radio_header.setItem(i, j, item)
+                self.model_radio_header.setItem(0, j, item)
 
     def show_curve_subcarrier_filter(self):
         self.wave_filtering_flag = self.checkBox_wave_filtering.isChecked()
@@ -1019,17 +1376,24 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                 self.model_evaluate_statistics.setItem(row, 2, item)
 
     def command_boot(self):
+        if not self.serial_controller.is_connected():
+            self.timer_boot_command.stop()
+            return
+        self.boot_command_attempts += 1
         command = f'radar --csi_output_type {self.csi_output_type} --csi_output_format base64'
         self.serial_queue_write.put(command)
+        self.command_send_mode()
         if self.experiment_config and self.experiment_config.get('send_interval_ms') is not None:
             self.serial_queue_write.put(
                 f"radar --send_data_interval {int(self.experiment_config['send_interval_ms'])}"
             )
 
-        if self.checkBox_router_auto_connect.isChecked() and len(self.lineEdit_router_ssid.text()) > 0:
+        if (self.boot_command_attempts == 1 and self.checkBox_router_auto_connect.isChecked()
+                and len(self.lineEdit_router_ssid.text()) > 0):
             self.command_router_connect()
 
-        self.timer_boot_command.stop()
+        if self.boot_command_attempts >= 3:
+            self.timer_boot_command.stop()
 
     def command_predict_config(self):
         command = (f'radar --predict_someone_sensitivity {self.doubleSpinBox_predict_someone_sensitivity.value()}' +
@@ -1063,6 +1427,13 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             router_ssid=self.lineEdit_router_ssid.text(),
             router_password=self.lineEdit_router_password.text(),
         )
+
+    def command_send_mode(self):
+        if not self.serial_controller.is_connected():
+            return
+        mode = self.comboBox_send_mode.currentText().strip()
+        self.serial_queue_write.put(f'radar --send_mode {mode}')
+        self.save_gui_config(send_mode=mode)
 
     def command_custom(self):
         command = self.lineEdit_command.text()
@@ -1123,7 +1494,7 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
 
     def set_collect_inputs_enabled(self, enabled):
         for widget in (
-            self.lineEdit_participant_id, self.lineEdit_room_id,
+            self.lineEdit_participant_id, self.lineEdit_room_id, self.lineEdit_receiver_id,
             self.comboBox_collect_target, self.timeEdit_collect_delay,
             self.spinBox_collect_duration, self.spinBox_collect_number,
             self.checkBox_complex_csi, self.comboBox_calibration_role,
@@ -1149,23 +1520,34 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
     def apply_collection_metadata(self):
         participant_id = self.lineEdit_participant_id.text().strip()
         room_id = self.lineEdit_room_id.text().strip()
-        if not participant_id or not room_id:
-            QMessageBox.warning(self, '采集标签缺失', '请输入人员标签和地点标签后再开始采集。')
+        receiver_id = self.lineEdit_receiver_id.text().strip()
+        tx_rx_distance = round(float(self.doubleSpinBox_tx_rx_distance.value()), 2)
+        if not participant_id or not room_id or not receiver_id:
+            QMessageBox.warning(self, '采集标签缺失', '请输入人员、地点和设备标签后再开始采集。')
+            return False
+        if tx_rx_distance <= 0:
+            QMessageBox.warning(self, '距离未设置', '请输入发射端与接收端之间的直线距离，必须大于 0 米。')
             return False
         compact_id = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
-        if not compact_id.fullmatch(participant_id) or not compact_id.fullmatch(room_id):
+        if (not compact_id.fullmatch(participant_id) or not compact_id.fullmatch(room_id)
+                or not compact_id.fullmatch(receiver_id)):
             QMessageBox.warning(
                 self, '采集标签格式错误',
-                "人员和地点标签只能包含英文字母、数字、'.'、'_'、'-'，最长 64 个字符。"
+                "人员、地点和设备标签只能包含英文字母、数字、'.'、'_'、'-'，最长 64 个字符。"
             )
             return False
         if self.experiment_config:
             old_participant = str(self.experiment_config.get('participant_id', ''))
             old_room = str(self.experiment_config.get('room_id', ''))
-            if participant_id != old_participant or room_id != old_room:
+            old_receiver = str(self.experiment_config.get('receiver_id', ''))
+            old_distance = round(float(self.experiment_config.get('distance_m', 0) or 0), 2)
+            if (participant_id != old_participant or room_id != old_room
+                    or receiver_id != old_receiver or tx_rx_distance != old_distance):
                 updated_config = dict(self.experiment_config)
                 updated_config['participant_id'] = participant_id
                 updated_config['room_id'] = room_id
+                updated_config['receiver_id'] = receiver_id
+                updated_config['distance_m'] = tx_rx_distance
                 updated_config['date'] = datetime.now().strftime('%Y-%m-%d')
                 try:
                     ExperimentLedger(
@@ -1182,17 +1564,20 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                 self.experiment_config.update(updated_config)
                 self.setWindowTitle(
                     f"ESP CSI 研究采集 - {self.experiment_config['session_id']} - "
-                    f"{participant_id} - {room_id}"
+                    f"{participant_id} - {room_id} - {receiver_id}"
                 )
         self.serial_queue_write.put({
             'type': 'update_collection_metadata',
             'participant_id': participant_id,
             'room_id': room_id,
+            'receiver_id': receiver_id,
+            'distance_m': tx_rx_distance,
             'complex_csi_enabled': self.checkBox_complex_csi.isChecked(),
             'calibration_role': self.comboBox_calibration_role.currentData() or 'activity',
         })
         try:
-            self.save_gui_config(participant_id=participant_id, room_id=room_id)
+            self.save_gui_config(participant_id=participant_id, room_id=room_id,
+                                 receiver_id=receiver_id, distance_m=tx_rx_distance)
         except Exception as e:
             self.show_textBrowser_log(f'<font color="yellow">无法保存人员/地点默认值：{e}</font>')
         return True
@@ -1295,10 +1680,12 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             self.save_gui_config(
                 participant_id=self.lineEdit_participant_id.text().strip(),
                 room_id=self.lineEdit_room_id.text().strip(),
+                receiver_id=self.lineEdit_receiver_id.text().strip(),
                 collect_action=self.comboBox_collect_target.currentData(),
                 collect_wait_seconds=self.timeEdit_collect_delay.value(),
                 collect_duration_seconds=self.spinBox_collect_duration.value(),
                 collect_number=self.spinBox_collect_number.value(),
+                distance_m=round(float(self.doubleSpinBox_tx_rx_distance.value()), 2),
                 complex_csi_enabled=self.checkBox_complex_csi.isChecked(),
                 calibration_role=self.comboBox_calibration_role.currentData() or 'activity',
             )
@@ -1400,15 +1787,18 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.save_gui_config(
             participant_id=self.lineEdit_participant_id.text().strip(),
             room_id=self.lineEdit_room_id.text().strip(),
+            receiver_id=self.lineEdit_receiver_id.text().strip(),
             collect_action=self.comboBox_collect_target.currentData() or 'none',
             collect_wait_seconds=self.timeEdit_collect_delay.value(),
             collect_duration_seconds=self.spinBox_collect_duration.value(),
             collect_number=self.spinBox_collect_number.value(),
+            distance_m=round(float(self.doubleSpinBox_tx_rx_distance.value()), 2),
             language=self.language,
             complex_csi_enabled=self.checkBox_complex_csi.isChecked(),
             calibration_role=self.comboBox_calibration_role.currentData() or 'activity',
         )
-        self.serial_queue_write.put('exit')
+        self.timer_boot_command.stop()
+        self.serial_controller.stop()
         event.accept()
 
     def resizeEvent(self, event):
@@ -1418,6 +1808,7 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
 
 
 def csi_data_handle(self, data):
+    global g_csi_update_counter
     # Rotate data
     g_csi_amplitude_array[:-1] = g_csi_amplitude_array[1:]
     g_rssi_array[:-1] = g_rssi_array[1:]
@@ -1426,33 +1817,18 @@ def csi_data_handle(self, data):
     csi_raw_data = data['data']
     data_len = int(data['len']) if 'len' in data else len(csi_raw_data)
 
-    if data_len == 104:
-        for i in range(CSI_DATA_COLUMNS):
-            idx = csi_vaid_subcarrier_index[i]
-
-            if idx * 4 + 3 >= len(csi_raw_data):
-                return
-            real_high = csi_raw_data[idx * 4 + 1]
-            imag_high = csi_raw_data[idx * 4 + 3]
-            real_low = csi_raw_data[idx * 4] & 0xFF
-            imag_low = csi_raw_data[idx * 4 + 2] & 0xFF
-
-            real = (((int(real_high) << 12) >> 4) | real_low)
-            imag = (((int(imag_high) << 12) >> 4) | imag_low)
-            if real > 32767:
-                real = real - 65536
-            if imag > 32767:
-                imag = imag - 65536
-
-            g_csi_amplitude_array[-1][i] = np.abs(complex(real, imag))
-    else:
-        for i in range(CSI_DATA_COLUMNS):
-            if csi_vaid_subcarrier_index[i]*2+1 >= len(csi_raw_data):
-                return
-            g_csi_amplitude_array[-1][i] = np.abs(complex(csi_raw_data[csi_vaid_subcarrier_index[i]*2], csi_raw_data[csi_vaid_subcarrier_index[i]*2+1]))
+    # ESP32-S3 reports a 104-byte LLTF frame as 52 interleaved signed
+    # 8-bit I/Q samples.  The old 4-byte stride overran after six carriers.
+    for i in range(CSI_DATA_COLUMNS):
+        idx = csi_vaid_subcarrier_index[i]
+        if idx * 2 + 1 >= len(csi_raw_data):
+            return
+        g_csi_amplitude_array[-1][i] = np.abs(
+            complex(csi_raw_data[idx * 2], csi_raw_data[idx * 2 + 1]))
 
     g_rssi_array[-1] = data['rssi']
     g_radio_header_pd.loc[0] = data[1:len(CSI_DATA_COLUMNS_NAMES)-1]
+    g_csi_update_counter += 1
     # print(g_radio_header_pd.loc[0])
 
     return
@@ -1549,12 +1925,12 @@ class DataHandleThread(QThread):
             series = self.serial_queue_read.get()
             if series['type'] == 'EXIT_EVENT':
                 break
-            elif series['type'] == 'DEVICE_INFO' and g_display_raw_data:
+            elif series['type'] == 'DEVICE_INFO':
                 g_device_info_series = series.copy()
                 self.signal_device_info.emit(series)
-            elif series['type'] == 'CSI_DATA' and g_display_raw_data:
+            elif series['type'] == 'CSI_DATA':
                 csi_data_handle(self, series)
-            elif series['type'] == 'RADAR_DADA' and g_display_radar_model:
+            elif series['type'] == 'RADAR_DADA':
                 radar_data_handle(self, series)
             elif series['type'] == 'LOG_DATA' and g_display_raw_data:
                 if series['tag'] == 'I':
@@ -1640,6 +2016,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
         print('警告：兼容采集模式不记录参与者、会话和房间信息，不能用于跨域泛化结论。')
     active_participant_id = str(experiment_config.get('participant_id', 'PERSON')) if experiment_config else 'PERSON'
     active_room_id = str(experiment_config.get('room_id', 'ROOM')) if experiment_config else 'ROOM'
+    active_receiver_id = str(experiment_config.get('receiver_id', 'RECEIVER')) if experiment_config else 'RECEIVER'
 
     run_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_folder = Path('log') / (f"{experiment_config['session_id']}_{run_stamp}" if experiment_config else run_stamp)
@@ -1661,6 +2038,12 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
         data_valid_list.at[i, 'file_writer'] = writer
 
     log_data_writer = open(log_folder / 'log_data.txt', 'w+', encoding='utf-8')
+    command_count = 0
+    raw_line_count = 0
+    csi_line_count = 0
+    csi_decode_failures = 0
+    csi_length_mismatches = 0
+    last_diagnostic = time.monotonic()
     taget_last = 'unknown'
     taget_seq_last = 0
     csi_target_data_file_fd = None
@@ -1703,8 +2086,12 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
     time.sleep(0.01)
 
     while True:
-        if not queue_write.empty():
-            command = queue_write.get()
+        try:
+            command = queue_write.get_nowait()
+        except Empty:
+            command = None
+
+        if command is not None:
 
             if command == 'exit':
                 close_serial_resources(recording_status='aborted')
@@ -1713,12 +2100,18 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
             if isinstance(command, dict) and command.get('type') == 'update_collection_metadata':
                 participant_id = str(command.get('participant_id', '')).strip()
                 room_id = str(command.get('room_id', '')).strip()
+                receiver_id = str(command.get('receiver_id', '')).strip()
+                try:
+                    distance_m = round(float(command.get('distance_m', 0)), 2)
+                except (TypeError, ValueError):
+                    distance_m = 0.0
                 if ledger is None or experiment_config is None:
                     session_data_root = Path(data_root) / room_id / datetime.now().strftime('%Y-%m-%d')
                     session_data_root.mkdir(parents=True, exist_ok=True)
                     active_participant_id = participant_id
                     active_room_id = room_id
-                    print(f'兼容采集标签已更新：人员={participant_id}，地点={room_id}，目录={session_data_root}')
+                    active_receiver_id = receiver_id
+                    print(f'兼容采集标签已更新：人员={participant_id}，地点={room_id}，设备={receiver_id}，目录={session_data_root}')
                     continue
                 if ledger.active is not None:
                     queue_read.put(pd.Series(
@@ -1730,6 +2123,8 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                     updated_config = dict(experiment_config)
                     updated_config['participant_id'] = participant_id
                     updated_config['room_id'] = room_id
+                    updated_config['receiver_id'] = receiver_id
+                    updated_config['distance_m'] = distance_m
                     updated_config['date'] = datetime.now().strftime('%Y-%m-%d')
                     updated_root = dated_collection_root(updated_config)
                     # Re-open the ledger so an existing manifest is checked
@@ -1746,7 +2141,8 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                 ledger = updated_ledger
                 active_participant_id = participant_id
                 active_room_id = room_id
-                print(f'采集标签已更新：人员={participant_id}，地点={room_id}')
+                active_receiver_id = receiver_id
+                print(f'采集标签已更新：人员={participant_id}，地点={room_id}，设备={receiver_id}')
                 continue
 
             if isinstance(command, dict) and command.get('type') == 'update_physics_capture':
@@ -1781,6 +2177,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
 
             command = command + '\r\n'
             set.write(command.encode('utf-8'))
+            command_count += 1
             print(f'{datetime.now()}, serial write: {command}')
             continue
 
@@ -1788,7 +2185,16 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
             raw_bytes = set.readline()
             host_received_ns = time.monotonic_ns()
             if not raw_bytes:
+                if time.monotonic() - last_diagnostic >= 5:
+                    diagnostic = (f'串口状态：命令={command_count}，原始行={raw_line_count}，'
+                                  f'CSI行={csi_line_count}，解码失败={csi_decode_failures}，'
+                                  f'长度不匹配={csi_length_mismatches}')
+                    print(diagnostic)
+                    log_data_writer.write(diagnostic + '\n')
+                    log_data_writer.flush()
+                    last_diagnostic = time.monotonic()
                 continue
+            raw_line_count += 1
             try:
                 strings = raw_bytes.decode('utf-8').strip()
             except UnicodeDecodeError:
@@ -1857,15 +2263,18 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
 
                     # print(data_series)
                     if data_series['type'] == 'CSI_DATA':
+                        csi_line_count += 1
                         try:
                             # csi_raw_data = json.loads(data_series['data'])
                             csi_raw_data = base64_decode_bin(
                                 data_series['data'])
                             # 如果解码失败返回空列表，跳过这条数据
                             if len(csi_raw_data) == 0:
+                                csi_decode_failures += 1
                                 print(f"CSI_DATA decode failed, skipping data: {data_series['data'][:50]}...")
                                 break
                             if len(csi_raw_data) != int(data_series['len']):
+                                csi_length_mismatches += 1
                                 # if len(csi_raw_data) != 104 and len(csi_raw_data) != 216 and len(csi_raw_data) != 328 and len(csi_raw_data) != 552:
                                 print(
                                     f"CSI_DATA, expected: {data_series['len']}, actual: {len(csi_raw_data)}")
@@ -1893,9 +2302,11 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                                 if experiment_config:
                                     room_id = str(experiment_config.get('room_id', 'ROOM'))
                                     participant_id = str(experiment_config.get('participant_id', 'PERSON'))
+                                    receiver_id = str(experiment_config.get('receiver_id', 'RECEIVER'))
                                 else:
                                     room_id = active_room_id
                                     participant_id = active_participant_id
+                                    receiver_id = active_receiver_id
                                 csi_target_data_file_name = folder / (
                                     f"{capture_time}_{room_id}_{participant_id}_{action_label}_"
                                     f"{data_series['taget_seq']}.csv"
@@ -1998,10 +2409,6 @@ if __name__ == '__main__':
     signal_key.signal(signal_key.SIGINT, quit)
     signal_key.signal(signal_key.SIGTERM, quit)
 
-    serial_handle_process = Process(target=serial_handle, args=(
-        serial_queue_read, serial_queue_write, serial_port, experiment_config, args.data_root))
-    serial_handle_process.start()
-
     app = QApplication(sys.argv)
     available_font_families = set(QFontDatabase().families())
     for font_family in ('Microsoft YaHei UI', 'Microsoft YaHei', 'SimHei'):
@@ -2010,7 +2417,12 @@ if __name__ == '__main__':
             break
     app.setWindowIcon(QIcon('../../../docs/_static/icon.png'))
 
-    window = DataGraphicalWindow(serial_queue_write, csi_output_type, experiment_config, args.data_root)
+    serial_controller = SerialConnectionController(
+        serial_queue_read, serial_queue_write, csi_output_type,
+        experiment_config, args.data_root)
+    window = DataGraphicalWindow(
+        serial_controller, csi_output_type, experiment_config, args.data_root,
+        initial_port=serial_port)
     data_handle_thread = DataHandleThread(serial_queue_read)
     data_handle_thread.signal_device_info.connect(window.show_device_info)
     data_handle_thread.signal_log_msg.connect(window.show_textBrowser_log)
@@ -2018,18 +2430,14 @@ if __name__ == '__main__':
     data_handle_thread.start()
 
     window.show()
+    if serial_port:
+        window.toggle_serial_connection()
     exit_code = app.exec()
 
     # Ensure a GUI close, Ctrl+C, or serial failure all produce the same
     # recoverable shutdown path. The serial worker marks any active trial as
     # aborted so partial data remain visible to the session validator.
-    if serial_handle_process.is_alive():
-        serial_queue_write.put('exit')
-        serial_handle_process.join(timeout=5)
-    if serial_handle_process.is_alive():
-        print('WARNING: serial worker did not stop within 5 seconds; terminating it')
-        serial_handle_process.terminate()
-        serial_handle_process.join(timeout=2)
+    serial_controller.stop()
     serial_queue_read.put(pd.Series(index=['type'], data=['EXIT_EVENT']))
     data_handle_thread.wait(2000)
     sys.exit(exit_code)

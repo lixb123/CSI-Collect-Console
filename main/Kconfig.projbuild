@@ -2,10 +2,20 @@ menu "Research CSI receiver"
 
 config RESEARCH_RX_ESPNOW_MODE
     bool "Use the external research ESP-NOW transmitter"
-    default y
+    default n
     help
         Keep the CSI source-MAC filter on 1a:00:00:00:00:00 and do not start
         the receiver's legacy router-ping/null-data traffic generator. Disable
         this option to retain the legacy router-triggered CSI workflow.
+
+config RESEARCH_RX_NULL_DATA_MODE
+    bool "Use high-rate null-data CSI trigger for connected APs"
+    default n
+    depends on !RESEARCH_RX_ESPNOW_MODE
+    help
+        Send an 802.11 null-data frame every configured CSI interval after the
+        station connects. The access point ACKs the frame, creating a
+        high-rate CSI source for normal routers and the optional ESP32 SoftAP.
+        ESP-NOW mode disables this setting and retains its dedicated workflow.
 
 endmenu

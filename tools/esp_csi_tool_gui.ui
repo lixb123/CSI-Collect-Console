@@ -188,11 +188,11 @@
             <property name="rightMargin">
              <number>0</number>
             </property>
-            <property name="bottomMargin">
-             <number>0</number>
-            </property>
+           <property name="bottomMargin">
+            <number>0</number>
+           </property>
             <item>
-             <widget class="QGroupBox" name="groupBox_11">
+             <widget class="QGroupBox" name="groupBox_serial">
               <property name="sizePolicy">
                <sizepolicy hsizetype="Preferred" vsizetype="Minimum">
                 <horstretch>0</horstretch>
@@ -208,9 +208,9 @@
                </font>
               </property>
               <property name="title">
-               <string>路由器</string>
+               <string>串口连接</string>
               </property>
-              <layout class="QHBoxLayout" name="horizontalLayout_13" stretch="1,4,1,4,1,2">
+              <layout class="QHBoxLayout" name="horizontalLayout_serial">
                <property name="spacing">
                 <number>9</number>
                </property>
@@ -227,6 +227,128 @@
                 <number>0</number>
                </property>
                <item>
+                <widget class="QLabel" name="label_serial_port">
+                 <property name="text">
+                  <string>COM 端口</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+               <widget class="QComboBox" name="comboBox_serial_port">
+                 <property name="minimumSize">
+                  <size>
+                   <width>120</width>
+                   <height>34</height>
+                  </size>
+                 </property>
+                 <property name="editable">
+                  <bool>true</bool>
+                 </property>
+                 <property name="placeholderText">
+                  <string>选择或输入 COM 端口</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QPushButton" name="pushButton_serial_refresh">
+                 <property name="minimumSize">
+                  <size>
+                   <width>76</width>
+                   <height>34</height>
+                  </size>
+                 </property>
+                 <property name="autoDefault">
+                  <bool>false</bool>
+                 </property>
+                 <property name="default">
+                  <bool>false</bool>
+                 </property>
+                 <property name="text">
+                  <string>刷新</string>
+                 </property>
+                 <property name="toolTip">
+                  <string>重新扫描当前可用的 COM 串口。</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="label_serial_status">
+                 <property name="text">
+                  <string>未连接</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QPushButton" name="pushButton_serial_connect">
+                 <property name="minimumSize">
+                  <size>
+                   <width>90</width>
+                   <height>34</height>
+                  </size>
+                 </property>
+                 <property name="autoDefault">
+                  <bool>false</bool>
+                 </property>
+                 <property name="default">
+                  <bool>false</bool>
+                 </property>
+                 <property name="text">
+                  <string>连接</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <spacer name="horizontalSpacer_serial">
+                 <property name="orientation">
+                  <enum>Qt::Horizontal</enum>
+                 </property>
+                 <property name="sizeHint" stdset="0">
+                  <size>
+                   <width>40</width>
+                   <height>20</height>
+                  </size>
+                 </property>
+                </spacer>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
+              <widget class="QGroupBox" name="groupBox_11">
+              <property name="sizePolicy">
+               <sizepolicy hsizetype="Preferred" vsizetype="Minimum">
+                <horstretch>0</horstretch>
+                <verstretch>0</verstretch>
+               </sizepolicy>
+              </property>
+              <property name="font">
+               <font>
+                <pointsize>10</pointsize>
+                <weight>50</weight>
+                <bold>false</bold>
+                <stylestrategy>PreferAntialias</stylestrategy>
+               </font>
+              </property>
+               <property name="title">
+                <string>Wi-Fi 接入点（路由器 / ESP32 SoftAP）</string>
+              </property>
+              <layout class="QGridLayout" name="horizontalLayout_13">
+               <property name="spacing">
+                <number>9</number>
+               </property>
+               <property name="leftMargin">
+                <number>0</number>
+               </property>
+               <property name="topMargin">
+                <number>0</number>
+               </property>
+               <property name="rightMargin">
+                <number>0</number>
+               </property>
+               <property name="bottomMargin">
+                <number>0</number>
+               </property>
+               <item row="0" column="0">
                 <widget class="QLabel" name="label_delay_2">
                  <property name="sizePolicy">
                   <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
@@ -239,10 +361,10 @@
                  </property>
                 </widget>
                </item>
-               <item>
+               <item row="0" column="1">
                 <widget class="QLineEdit" name="lineEdit_router_ssid"/>
                </item>
-               <item>
+               <item row="0" column="2">
                 <widget class="QLabel" name="label_duration_2">
                  <property name="sizePolicy">
                   <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
@@ -255,20 +377,41 @@
                  </property>
                 </widget>
                </item>
-               <item>
+               <item row="0" column="3">
                 <widget class="QLineEdit" name="lineEdit_router_password"/>
                </item>
-               <item>
+               <item row="1" column="0">
+                <widget class="QLabel" name="label_send_mode">
+                 <property name="text">
+                  <string>触发</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="1" column="1">
+                <widget class="QComboBox" name="comboBox_send_mode">
+                 <item>
+                  <property name="text">
+                   <string>router_ping</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>null_data</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item row="1" column="2">
                 <widget class="QCheckBox" name="checkBox_router_auto_connect">
                  <property name="text">
                   <string>自动连接</string>
                  </property>
                  <property name="checked">
-                  <bool>true</bool>
+                  <bool>false</bool>
                  </property>
                 </widget>
                </item>
-               <item>
+               <item row="1" column="3">
                 <widget class="QPushButton" name="pushButton_router_connect">
                  <property name="font">
                   <font>
@@ -1447,7 +1590,7 @@
                 <number>10</number>
                </property>
                <item>
-                <layout class="QHBoxLayout" name="horizontalLayout_collect_metadata" stretch="0,3,0,3">
+               <layout class="QHBoxLayout" name="horizontalLayout_collect_metadata" stretch="0,3,0,3,0,3">
                  <property name="spacing">
                   <number>10</number>
                  </property>
@@ -1499,7 +1642,7 @@
                   </widget>
                  </item>
                  <item>
-                  <widget class="QLineEdit" name="lineEdit_room_id">
+                 <widget class="QLineEdit" name="lineEdit_room_id">
                    <property name="minimumSize">
                     <size>
                      <width>0</width>
@@ -1517,10 +1660,43 @@
                    </property>
                   </widget>
                  </item>
+                 <item>
+                  <widget class="QLabel" name="label_receiver_id">
+                   <property name="font">
+                    <font>
+                     <pointsize>10</pointsize>
+                     <weight>75</weight>
+                     <bold>true</bold>
+                    </font>
+                   </property>
+                   <property name="text">
+                    <string>设备标签（receiver_id）</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QLineEdit" name="lineEdit_receiver_id">
+                   <property name="minimumSize">
+                    <size>
+                     <width>0</width>
+                     <height>34</height>
+                    </size>
+                   </property>
+                   <property name="toolTip">
+                    <string>接收设备的自定义编号，例如 ESP32-RX-01。研究采集时从实验配置读取。</string>
+                   </property>
+                   <property name="placeholderText">
+                    <string>未配置（例如 ESP32-RX-01）</string>
+                   </property>
+                   <property name="maxLength">
+                    <number>64</number>
+                   </property>
+                  </widget>
+                 </item>
                 </layout>
                </item>
                <item>
-                <layout class="QHBoxLayout" name="horizontalLayout_9" stretch="1,3,1,3,1,3,1,3,1,3">
+               <layout class="QHBoxLayout" name="horizontalLayout_9" stretch="1,3,1,3,1,3,1,3,1,3">
                  <property name="spacing">
                   <number>9</number>
                  </property>
@@ -1775,6 +1951,67 @@
                     <bool>false</bool>
                    </property>
                   </widget>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <layout class="QHBoxLayout" name="horizontalLayout_tx_rx_distance">
+                 <property name="spacing">
+                  <number>10</number>
+                 </property>
+                 <item>
+                  <widget class="QLabel" name="label_tx_rx_distance">
+                   <property name="text">
+                    <string>Tx_Rx_Dis:</string>
+                   </property>
+                   <property name="toolTip">
+                    <string>发射端（普通路由器、ESP32 SoftAP 或专用发射端）与接收端之间的直线距离，单位：米。</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QDoubleSpinBox" name="doubleSpinBox_tx_rx_distance">
+                   <property name="minimumSize">
+                    <size>
+                     <width>120</width>
+                     <height>34</height>
+                    </size>
+                   </property>
+                   <property name="toolTip">
+                    <string>发射端与接收端的直线距离；保存到 session_manifest.csv 和每个记录的 .meta.json。单位：米。</string>
+                   </property>
+                   <property name="suffix">
+                    <string> m</string>
+                   </property>
+                   <property name="decimals">
+                    <number>2</number>
+                   </property>
+                   <property name="minimum">
+                    <double>0.000000000000000</double>
+                   </property>
+                   <property name="maximum">
+                    <double>1000.000000000000000</double>
+                   </property>
+                   <property name="singleStep">
+                    <double>0.100000000000000</double>
+                   </property>
+                   <property name="value">
+                    <double>0.000000000000000</double>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <spacer name="horizontalSpacer_tx_rx_distance">
+                   <property name="orientation">
+                    <enum>Qt::Horizontal</enum>
+                   </property>
+                   <property name="sizeHint" stdset="0">
+                    <size>
+                     <width>40</width>
+                     <height>20</height>
+                    </size>
+                   </property>
+                  </spacer>
                  </item>
                 </layout>
                </item>
