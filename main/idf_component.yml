@@ -2,6 +2,8 @@
 dependencies:
   idf: ">=4.4.1"
 
-  esp-radar: ">=0.3.0"
+  espressif/esp-radar:
+    version: "0.3.4"
+    override_path: "../vendor/esp-radar"
 
   espressif/led_strip: "^2.5.3"

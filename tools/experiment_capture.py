@@ -17,15 +17,17 @@ import re
 import socket
 import sys
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from complex_csi import ComplexCSIQuality, complex_layout_metadata
+from acquisition_quality import acquisition_defaults, baseline_fingerprint, LinkTiming
 
 
-SCHEMA_VERSION = "csi-experiment-manifest/1.0"
+SCHEMA_VERSION = "csi-experiment-manifest/1.1"
 FALL_ACTION = "wave"
 FALL_ACTIONS = {"wave", "fall_forward", "fall_backward", "fall_left", "fall_right"}
 NON_FALL_ACTIONS = {
@@ -35,9 +37,9 @@ NON_FALL_ACTIONS = {
 }
 MANIFEST_COLUMNS = [
     "schema_version", "recording_id", "relative_csv_path", "sidecar_path",
-    "sha256", "participant_id", "session_id", "date", "room_id",
+    "sha256", "participant_id", "session_id", "date", "room_id", "site_id",
     "action", "binary_label", "fall_type", "trial_id", "activity_order",
-    "router_id", "receiver_id", "sender_id", "router_position",
+    "router_id", "receiver_id", "sender_id", "device_pair_id", "router_position",
     "receiver_position", "sender_position", "orientation", "distance_m",
     "scenario", "occupancy", "interference_condition", "csi_output_type",
     "complex_csi_enabled", "csi_component_order", "phase_sanitization",
@@ -51,11 +53,17 @@ MANIFEST_COLUMNS = [
     "host_pipeline_latency_ms_mean", "host_pipeline_latency_ms_p95", "host_device_span_skew_ms",
     "rssi_mean", "rssi_std", "noise_floor_mean", "agc_gain_mean",
     "channel_primary", "channel_secondary", "mcs", "bandwidth",
-    "csi_len", "rx_state_nonzero", "first_word_invalid_count",
+    "csi_len", "target_mac", "observed_primary_mac", "target_mac_frame_fraction",
+    "unexpected_mac_frame_count", "dominant_phy_signature", "dominant_phy_fraction",
+    "phy_signature_count", "phy_switch_count", "quality_status", "quality_reasons",
+    "baseline_required", "baseline_min_duration_s", "baseline_ready_at_start",
+    "rx_state_nonzero", "first_word_invalid_count",
     "complex_frames", "complex_invalid_frames", "complex_subcarriers_min", "complex_subcarriers_max",
     "complex_low_amplitude_fraction", "phase_residual_rms_mean",
     "phase_adjacent_coherence_mean", "phase_temporal_step_rms_mean", "phase_quality_status",
     "device_csi_received_delta", "device_queue_drop_delta",
+    "device_null_tx_count_delta", "device_null_tx_error_count_delta",
+    "device_null_ack_or_response_count_delta", "device_wifi_connected_end",
     "receiver_valid_research_packets_delta", "receiver_research_bytes_delta",
     "receiver_research_crc_errors_delta", "receiver_research_other_errors_delta",
     "receiver_research_sequence_gaps_delta", "receiver_research_last_seq",
@@ -64,8 +72,16 @@ MANIFEST_COLUMNS = [
     "host_name", "python_version",
     "collector_version", "collector_sha256", "config_sha256",
     "firmware_app_revision", "firmware_idf_revision", "firmware_compile_time",
-    "chip_name", "chip_revision",
+    "chip_name", "chip_revision", "firmware_device_mac", "capture_protocol",
     "started_at_utc", "ended_at_utc", "status", "notes",
+]
+MANIFEST_COLUMNS += [
+    'quality_policy_version', 'baseline_fingerprint', 'connected_ap_bssid',
+    'connected_ap_ssid', 'raw_stream_path', 'source_filter_enabled', 'excluded_source_frames',
+    'target_frame_count', 'target_sample_rate_hz', 'target_gap_p95_ms', 'target_gap_max_ms',
+    'target_long_gap_count', 'target_clock_error_count', 'target_dominant_phy_fraction',
+    'target_dominant_phy_gap_max_ms', 'target_dominant_phy_rate_hz', 'needs_retake',
+    'target_time_coverage_s',
 ]
 
 
@@ -100,6 +116,68 @@ def compact_json(value: Any) -> str:
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return safe_text(value)
+
+
+def normalize_mac(value: Any) -> str:
+    text = safe_text(value).lower().replace("-", ":")
+    if not text:
+        return ""
+    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", text):
+        raise ValueError(f"Invalid MAC address: {value!r}")
+    return text
+
+
+def device_pair_id(config: dict[str, Any]) -> str:
+    receiver = safe_text(config.get("receiver_id")) or "receiver-unknown"
+    sender = safe_text(config.get("sender_id")) or safe_text(config.get("router_id")) or "sender-unknown"
+    return f"{receiver}__{sender}"
+
+
+def session_reference_status(
+    data_root: Path, config: dict[str, Any], calibration_role: str,
+    minimum_s: float = 60,
+) -> dict[str, Any]:
+    """Return the latest qualifying reference capture for this session and link."""
+    minimum_s = float(minimum_s or 60)
+    manifest = Path(data_root) / "session_manifest.csv"
+    result = {"ready": False, "recording_id": "", "reason": "missing", "minimum_s": minimum_s}
+    if not manifest.exists() or manifest.stat().st_size == 0:
+        return result
+    with manifest.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    session_id = safe_text(config.get("session_id"))
+    candidates = [
+        row for row in rows
+        if safe_text(row.get("session_id")) == session_id
+        and safe_text(row.get("calibration_role")) == calibration_role
+        and safe_text(row.get("status")) == "complete"
+    ]
+    for row in reversed(candidates):
+        if config.get('acquisition_gate_enabled') and row.get('baseline_fingerprint') != baseline_fingerprint(config):
+            result['reason'] = 'acquisition_settings_changed_or_legacy_baseline'
+            continue
+        duration_s = safe_float(row.get("device_time_span_s")) or safe_float(row.get("host_time_span_s")) or 0.0
+        quality = safe_text(row.get("quality_status"))
+        if duration_s >= minimum_s * 0.9 and quality in {"pass", "warn"}:
+            return {
+                "ready": True,
+                "recording_id": safe_text(row.get("recording_id")),
+                "reason": quality,
+                "minimum_s": minimum_s,
+            }
+        result = {
+            "ready": False,
+            "recording_id": safe_text(row.get("recording_id")),
+            "reason": f"duration={duration_s:.2f}s, quality={quality or 'unknown'}",
+            "minimum_s": minimum_s,
+        }
+    return result
+
+
+def session_baseline_status(data_root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Return the latest qualifying occupied, static-person baseline."""
+    minimum_s = float(config.get("baseline_min_duration_s", 60) or 60)
+    return session_reference_status(data_root, config, "static_reference", minimum_s)
 
 
 def validate_action_label(value: Any) -> str:
@@ -158,7 +236,7 @@ def load_experiment_config(path: str | os.PathLike[str] | None) -> dict[str, Any
     if missing:
         raise ValueError(f"Experiment config missing required fields: {', '.join(missing)}")
     compact_id = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-    for key in ("participant_id", "session_id", "room_id", "receiver_id", "sender_id", "router_id"):
+    for key in ("participant_id", "session_id", "room_id", "site_id", "receiver_id", "sender_id", "router_id"):
         value = safe_text(config.get(key))
         if value and not compact_id.fullmatch(value):
             raise ValueError(
@@ -193,11 +271,27 @@ def load_experiment_config(path: str | os.PathLike[str] | None) -> dict[str, Any
     config.setdefault("csi_scale_shift", 0)
     config.setdefault("calibration_role", "activity")
     config.setdefault("calibration_id", "")
+    config.setdefault("site_id", safe_text(config.get("room_id")))
+    config.setdefault("target_mac", "")
+    config["target_mac"] = normalize_mac(config.get("target_mac"))
+    config.setdefault("require_static_baseline", True)
+    config.setdefault("baseline_min_duration_s", 60)
+    config.setdefault("minimum_target_mac_fraction", 0.95)
+    config.setdefault("minimum_dominant_phy_fraction", 0.95)
+    config.setdefault("minimum_telemetry_samples", 1)
+    config["minimum_telemetry_samples"] = max(1, safe_int(config.get("minimum_telemetry_samples")) or 1)
+    config.setdefault("device_pair_id", device_pair_id(config))
     if config["csi_component_order"] != "imag_real_interleaved":
         raise ValueError("csi_component_order must be imag_real_interleaved for ESP-IDF CSI")
     if config["calibration_role"] not in {"activity", "empty_room_reference", "static_reference"}:
         raise ValueError("calibration_role must be activity, empty_room_reference, or static_reference")
     config.setdefault("notes", "")
+    config = acquisition_defaults(config)
+    for key in ('minimum_target_rate_hz', 'maximum_target_gap_ms', 'mode_settle_seconds'):
+        value = safe_float(config[key])
+        if value is None or value <= 0:
+            raise ValueError(f'{key} must be a finite positive number')
+        config[key] = value
     config.setdefault("transmitter_experiment_id", safe_text(config["session_id"]))
     transmitter_experiment_id = safe_text(config["transmitter_experiment_id"])
     if not compact_id.fullmatch(transmitter_experiment_id) or len(transmitter_experiment_id) > 31:
@@ -251,6 +345,18 @@ class RecordingAccumulator:
     queue_high_water_since_boot: list[float] = field(default_factory=list)
     last_radio: dict[str, Any] = field(default_factory=dict)
     complex_quality: ComplexCSIQuality = field(default_factory=ComplexCSIQuality)
+    mac_counts: Counter[str] = field(default_factory=Counter)
+    phy_signature_counts: Counter[tuple[str, ...]] = field(default_factory=Counter)
+    previous_phy_signature: tuple[str, ...] | None = None
+    phy_switch_count: int = 0
+    baseline_ready_at_start: bool = False
+    target_timing: LinkTiming = field(default_factory=LinkTiming)
+    excluded_source_frames: int = 0
+    observed_start_ns: int | None = None
+    observed_end_ns: int | None = None
+    target_start_ns: int | None = None
+    target_end_ns: int | None = None
+    acquisition_errors: set[str] = field(default_factory=set)
 
     def add(self, row: dict[str, Any], host_received_ns: int, host_written_ns: int) -> None:
         seq = safe_int(row.get("seq"))
@@ -275,6 +381,16 @@ class RecordingAccumulator:
         self.last_radio = {key: row.get(key, "") for key in (
             "channel_primary", "channel_secondary", "mcs", "cwb", "len", "rate", "sig_mode", "mac"
         )}
+        mac = safe_text(row.get("mac")).lower()
+        if mac:
+            self.mac_counts[mac] += 1
+        phy_signature = tuple(safe_text(row.get(key)) for key in (
+            "rate", "sig_mode", "mcs", "cwb", "channel_primary", "channel_secondary", "len"
+        ))
+        self.phy_signature_counts[phy_signature] += 1
+        if self.previous_phy_signature is not None and phy_signature != self.previous_phy_signature:
+            self.phy_switch_count += 1
+        self.previous_phy_signature = phy_signature
         if row.get("data") is not None:
             self.complex_quality.add(row.get("data"))
         self.rows += 1
@@ -303,6 +419,9 @@ class ExperimentLedger:
         self._trial_counter = 0
         self.data_root.mkdir(parents=True, exist_ok=True)
         self._resume_existing_session()
+
+    def baseline_status(self) -> dict[str, Any]:
+        return session_baseline_status(self.data_root, self.config)
 
     def _resume_existing_session(self) -> None:
         if not self.manifest_path.exists() or self.manifest_path.stat().st_size == 0:
@@ -345,6 +464,9 @@ class ExperimentLedger:
             "send_mode": safe_text(self.config.get("send_mode", "router_ping")),
             "configured_send_interval_ms": safe_text(self.config.get("send_interval_ms")),
             "transmitter_experiment_id": safe_text(self.config.get("transmitter_experiment_id", self.config["session_id"])),
+            "site_id": safe_text(self.config.get("site_id", self.config.get("room_id"))),
+            "device_pair_id": safe_text(self.config.get("device_pair_id", device_pair_id(self.config))),
+            "target_mac": normalize_mac(self.config.get("target_mac")),
         }
         for field_name, configured in condition_fields.items():
             existing = {safe_text(row.get(field_name)) for row in rows if safe_text(row.get(field_name))}
@@ -360,6 +482,24 @@ class ExperimentLedger:
         self.telemetry.update(row)
         if self.active is not None:
             self.active.add_telemetry(row)
+            if self.config.get('acquisition_gate_enabled'):
+                dedicated = self.config.get('send_mode') == 'espnow_research'
+                if not dedicated and safe_int(row.get('wifi_connected')) != 1:
+                    self.active.acquisition_errors.add('wifi_disconnected_during_recording')
+                if dedicated:
+                    expected_hash = research_experiment_hash(str(self.config.get(
+                        'transmitter_experiment_id', self.config.get('session_id', ''))))
+                    if safe_int(row.get('research_rx_experiment_hash')) != expected_hash:
+                        self.active.acquisition_errors.add('transmitter_experiment_mismatch')
+                    for key in ('research_rx_crc_errors', 'research_rx_seq_gaps', 'research_rx_other_errors'):
+                        if (safe_int(row.get(key)) or 0) > (safe_int(self.active.telemetry_start.get(key)) or 0):
+                            self.active.acquisition_errors.add(key)
+                if row.get('send_mode') != self.config.get('send_mode', 'router_ping'):
+                    self.active.acquisition_errors.add('send_mode_changed_during_recording')
+                start = safe_int(self.active.telemetry_start.get('csi_received'))
+                current = safe_int(row.get('csi_received'))
+                if start is not None and current is not None and current < start:
+                    self.active.acquisition_errors.add('device_counter_reset')
 
     def note_device_info(self, row: dict[str, Any]) -> None:
         self.device_info = dict(row)
@@ -381,6 +521,13 @@ class ExperimentLedger:
         if self.active is not None:
             raise RuntimeError("A recording is already active")
         action = validate_action_label(action)
+        role = safe_text(self.config.get("calibration_role", "activity"))
+        baseline = self.baseline_status()
+        if (bool(self.config.get("require_static_baseline", False)) and role == "activity"
+                and not baseline["ready"]):
+            raise RuntimeError(
+                f"Static baseline is required before activity collection: {baseline['reason']}"
+            )
         self._trial_counter += 1
         started = utc_now()
         recording_id = f"rec-{started.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex[:8]}"
@@ -395,13 +542,29 @@ class ExperimentLedger:
             started_at=started,
             configured_duration_ms=duration_ms,
             telemetry_start=self.telemetry.snapshot(),
+            baseline_ready_at_start=bool(baseline["ready"]),
         )
         return self.active
 
-    def add_csi(self, row: dict[str, Any], host_received_ns: int, host_written_ns: int) -> None:
+    def add_csi(self, row: dict[str, Any], host_received_ns: int, host_written_ns: int) -> bool:
         if self.active is None:
             raise RuntimeError("No active recording")
-        self.active.add(row, host_received_ns, host_written_ns)
+        recording = self.active
+        if recording.observed_start_ns is None:
+            recording.observed_start_ns = host_received_ns
+        recording.observed_end_ns = host_received_ns
+        target = normalize_mac(self.config.get('target_mac'))
+        is_target = not target or safe_text(row.get('mac')).lower() == target
+        if is_target:
+            recording.target_timing.add(row)
+            if recording.target_start_ns is None:
+                recording.target_start_ns = host_received_ns
+            recording.target_end_ns = host_received_ns
+        elif self.config.get('target_only_recordings', False):
+            recording.excluded_source_frames += 1
+            return False
+        recording.add(row, host_received_ns, host_written_ns)
+        return True
 
     def finish(self, status: str = "complete") -> dict[str, Any] | None:
         if self.active is None:
@@ -427,13 +590,78 @@ class ExperimentLedger:
         end_drop = safe_int(telemetry_end.get("queue_drops"))
         transmitter_experiment_id = safe_text(
             self.config.get("transmitter_experiment_id", self.config.get("session_id")))
+        target_mac = normalize_mac(self.config.get("target_mac"))
+        primary_mac, primary_mac_count = recording.mac_counts.most_common(1)[0] if recording.mac_counts else ("", 0)
+        target_count = recording.mac_counts.get(target_mac, 0) if target_mac else primary_mac_count
+        target_fraction = target_count / recording.rows if recording.rows else 0.0
+        dominant_phy, dominant_phy_count = (
+            recording.phy_signature_counts.most_common(1)[0]
+            if recording.phy_signature_counts else (("",) * 7, 0)
+        )
+        dominant_phy_fraction = dominant_phy_count / recording.rows if recording.rows else 0.0
+        quality_reasons: list[str] = []
+        quality_warnings: list[str] = []
+        minimum_mac_fraction = float(self.config.get("minimum_target_mac_fraction", 0.95) or 0.95)
+        minimum_phy_fraction = float(self.config.get("minimum_dominant_phy_fraction", 0.95) or 0.95)
+        minimum_telemetry_samples = max(1, safe_int(self.config.get("minimum_telemetry_samples")) or 1)
+        if not target_mac:
+            quality_warnings.append("target_mac_not_configured_legacy")
+        elif target_fraction < minimum_mac_fraction:
+            quality_reasons.append(f"target_mac_fraction={target_fraction:.4f}<{minimum_mac_fraction:.4f}")
+        if dominant_phy_fraction < minimum_phy_fraction:
+            (quality_warnings if self.config.get('acquisition_gate_enabled') else quality_reasons).append(
+                f"dominant_phy_fraction={dominant_phy_fraction:.4f}<{minimum_phy_fraction:.4f}")
+        if target_mac and recording.telemetry_samples < minimum_telemetry_samples:
+            quality_reasons.append(
+                f"device_telemetry_samples={recording.telemetry_samples}<{minimum_telemetry_samples}"
+            )
+        if recording.rx_state_nonzero:
+            quality_reasons.append(f"rx_state_nonzero={recording.rx_state_nonzero}")
+        if recording.first_word_invalid_count:
+            quality_reasons.append(f"first_word_invalid={recording.first_word_invalid_count}")
+        duration_s = max((recording.configured_duration_ms or 0)/1000, device_span_s or 0, host_span_s or 0)
+        gap_limit = float(self.config.get('maximum_target_gap_ms', 100))
+        timing = recording.target_timing.summary(duration_s, gap_limit)
+        if self.config.get('acquisition_gate_enabled'):
+            quality_reasons.extend(sorted(recording.acquisition_errors))
+            if timing['target_sample_rate_hz'] < float(self.config.get('minimum_target_rate_hz', 50)):
+                quality_reasons.append(f"target_rate_too_low={timing['target_sample_rate_hz']:.2f}Hz")
+            if timing['target_gap_max_ms'] > gap_limit:
+                quality_reasons.append(f"target_gap_too_long={timing['target_gap_max_ms']:.2f}ms")
+            if duration_s - timing['target_time_coverage_s'] > 2 * gap_limit / 1000:
+                quality_reasons.append('target_does_not_cover_recording_duration')
+            if timing['target_clock_error_count']:
+                quality_reasons.append('target_timestamp_missing_or_nonmonotonic')
+            if recording.target_start_ns is not None and recording.observed_start_ns is not None:
+                edge_ms = max(recording.target_start_ns-recording.observed_start_ns,
+                              (recording.observed_end_ns or 0)-(recording.target_end_ns or 0))/1e6
+                if edge_ms > gap_limit:
+                    quality_reasons.append(f'target_missing_at_recording_edge={edge_ms:.2f}ms')
+            if start_drop is not None and end_drop is not None and end_drop > start_drop:
+                quality_reasons.append(f'device_queue_drops={end_drop-start_drop}')
+            if self.config.get('target_mac') != self.config.get('connected_ap_bssid'):
+                quality_reasons.append('target_ap_identity_unverified')
+            if timing['target_dominant_phy_gap_max_ms'] > gap_limit:
+                quality_warnings.append('dominant_phy_substream_has_long_gaps')
+        quality_status = "fail" if quality_reasons else ("warn" if quality_warnings else "pass")
+        quality_messages = quality_reasons + quality_warnings
+        recording_schema = SCHEMA_VERSION if target_mac else "csi-experiment-manifest/1.0"
 
         def telemetry_delta(key: str) -> int | None:
             start = safe_int(recording.telemetry_start.get(key))
             end = safe_int(telemetry_end.get(key))
             return max(0, end - start) if start is not None and end is not None else None
         row = {
-            "schema_version": SCHEMA_VERSION,
+            **timing,
+            'quality_policy_version': self.config.get('quality_policy_version', ''),
+            'baseline_fingerprint': baseline_fingerprint(self.config),
+            'connected_ap_bssid': self.config.get('connected_ap_bssid', ''),
+            'connected_ap_ssid': self.config.get('connected_ap_ssid', ''),
+            'raw_stream_path': self.config.get('raw_stream_path', ''),
+            'source_filter_enabled': bool(self.config.get('target_only_recordings', False)),
+            'excluded_source_frames': recording.excluded_source_frames,
+            'needs_retake': quality_status == 'fail',
+            "schema_version": recording_schema,
             "recording_id": recording.recording_id,
             "relative_csv_path": recording.csv_path.relative_to(self.data_root).as_posix(),
             "sidecar_path": recording.csv_path.with_suffix(".meta.json").relative_to(self.data_root).as_posix(),
@@ -442,6 +670,7 @@ class ExperimentLedger:
             "session_id": self.config.get("session_id"),
             "date": self.config.get("date"),
             "room_id": self.config.get("room_id"),
+            "site_id": self.config.get("site_id", self.config.get("room_id", "")),
             "action": action,
             "binary_label": binary_label,
             "fall_type": fall_type,
@@ -450,6 +679,7 @@ class ExperimentLedger:
             "router_id": self.config.get("router_id", ""),
             "receiver_id": self.config.get("receiver_id", ""),
             "sender_id": self.config.get("sender_id", ""),
+            "device_pair_id": self.config.get("device_pair_id", device_pair_id(self.config)),
             "router_position": compact_json(self.config.get("router_position", {})),
             "receiver_position": compact_json(self.config.get("receiver_position", {})),
             "sender_position": compact_json(self.config.get("sender_position", {})),
@@ -490,6 +720,22 @@ class ExperimentLedger:
             "mcs": recording.last_radio.get("mcs", ""),
             "bandwidth": recording.last_radio.get("cwb", ""),
             "csi_len": recording.last_radio.get("len", ""),
+            "target_mac": target_mac,
+            "observed_primary_mac": primary_mac,
+            "target_mac_frame_fraction": target_fraction,
+            "unexpected_mac_frame_count": max(0, recording.rows - target_count),
+            "dominant_phy_signature": compact_json(dict(zip(
+                ("rate", "sig_mode", "mcs", "bandwidth", "channel_primary", "channel_secondary", "csi_len"),
+                dominant_phy,
+            ))),
+            "dominant_phy_fraction": dominant_phy_fraction,
+            "phy_signature_count": len(recording.phy_signature_counts),
+            "phy_switch_count": recording.phy_switch_count,
+            "quality_status": quality_status,
+            "quality_reasons": compact_json(quality_messages),
+            "baseline_required": bool(self.config.get("require_static_baseline", False)),
+            "baseline_min_duration_s": self.config.get("baseline_min_duration_s", 60),
+            "baseline_ready_at_start": recording.baseline_ready_at_start,
             "rx_state_nonzero": recording.rx_state_nonzero,
             "first_word_invalid_count": recording.first_word_invalid_count,
             **recording.complex_quality.summary(),
@@ -497,6 +743,10 @@ class ExperimentLedger:
             if start_rx is not None and end_rx is not None else None,
             "device_queue_drop_delta": max(0, end_drop - start_drop)
             if start_drop is not None and end_drop is not None else None,
+            "device_null_tx_count_delta": telemetry_delta("null_tx_count"),
+            "device_null_tx_error_count_delta": telemetry_delta("null_tx_error_count"),
+            "device_null_ack_or_response_count_delta": telemetry_delta("null_ack_or_response_count"),
+            "device_wifi_connected_end": telemetry_end.get("wifi_connected", ""),
             "receiver_valid_research_packets_delta": telemetry_delta("research_rx_valid"),
             "receiver_research_bytes_delta": telemetry_delta("research_rx_bytes"),
             "receiver_research_crc_errors_delta": telemetry_delta("research_rx_crc_errors"),
@@ -520,6 +770,8 @@ class ExperimentLedger:
             "firmware_compile_time": self.device_info.get("compile_time", ""),
             "chip_name": self.device_info.get("chip_name", ""),
             "chip_revision": self.device_info.get("chip_revision", ""),
+            "firmware_device_mac": self.device_info.get("receiver_mac", ""),
+            "capture_protocol": self.device_info.get("capture_protocol", ""),
             "started_at_utc": iso_utc(recording.started_at),
             "ended_at_utc": iso_utc(ended),
             "status": status,
@@ -536,6 +788,16 @@ class ExperimentLedger:
         sidecar_path = recording.csv_path.with_suffix(".meta.json")
         sidecar_path.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
         exists = self.manifest_path.exists() and self.manifest_path.stat().st_size > 0
+        if exists:
+            with self.manifest_path.open(encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                existing_columns = reader.fieldnames or []
+                existing_rows = list(reader)
+            if existing_columns != MANIFEST_COLUMNS:
+                with self.manifest_path.open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=MANIFEST_COLUMNS, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(existing_rows)
         with self.manifest_path.open("a", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=MANIFEST_COLUMNS, extrasaction="ignore")
             if not exists:

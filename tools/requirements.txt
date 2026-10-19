@@ -1,8 +1,7 @@
-argparse
-pandas
-numpy
-path
-PyQt5
-pyqtgraph
-pyserial
-scipy
+numpy>=1.26,<3
+pandas>=2.1,<4
+PyQt5>=5.15,<6
+pyqtgraph>=0.13,<1
+pyserial>=3.5,<4
+scipy>=1.11,<2
+esptool>=4.7,<5

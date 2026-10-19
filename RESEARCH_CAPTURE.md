@@ -6,7 +6,7 @@ The original action CSV remains compatible with the existing cleaning code. Rese
 
 ### AI and pattern recognition
 
-The old collector saved an action folder and a timestamped file, but not the independent grouping keys needed to test generalization. Research mode records pseudonymous participant, session, date, room, device identities, geometry, action order, trial identity, fall semantics, and interference condition. `wave` is the demonstrated fall class unless `fall_type` explicitly says `incident_fall`; `move`, `static`, `none`, `front`, and `after` are non-falls.
+The old collector saved an action folder and a timestamped file, but not the independent grouping keys needed to test generalization. Research mode records pseudonymous participant, session, date, room, device identities, geometry, action order, trial identity, fall semantics, and interference condition. New sessions use the 14-label core protocol (`none`, `static`, `walk_slow`, `walk_fast`, `sit down`, `stand up`, `bend`, `pick_up`, `lie_down`, `turn`, and four directional falls). Legacy labels such as `wave`, `move`, `front`, and `after` remain readable for compatibility but do not satisfy the new-session core-action audit.
 
 ### ISAC
 
@@ -14,7 +14,7 @@ The CSI row already contains RSSI, rate, MCS, bandwidth, noise floor, channel, A
 
 ### ISCC
 
-The firmware now emits one `SYSTEM_TELEMETRY` row per second with device uptime, total CSI callbacks, CSI print-queue drops, queue depth/high-water mark, current free heap, historical minimum free heap, actual send interval, and the compiled sending mode (`espnow_research`, `router_ping`, or `null_data`). In the default `espnow_research` mode it also reports validated research-frame count, application payload bytes, CRC/protocol errors, packet-sequence gaps, last sequence, and observed experiment hash. The host records serial-read-to-CSV-write pipeline latency and host/device recording-span skew. The manifest keeps configured and observed send settings separately so configuration drift is visible. Per-recording summaries include the number of telemetry samples, maximum observed queue depth, and minimum observed free heap. The queue high-water and minimum-free-heap counters are explicitly marked as since-boot values. Device callback/drop deltas use the nearest available 1 Hz telemetry snapshots, so they are approximate at recording boundaries, especially for short trials.
+The firmware now emits one `SYSTEM_TELEMETRY` row per second with device uptime, total CSI callbacks, CSI print-queue drops, queue depth/high-water mark, current free heap, historical minimum free heap, actual send interval, and the compiled sending mode (`espnow_research`, `router_ping`, or `null_data`). In the dedicated `espnow_research` mode it also reports validated research-frame count, application payload bytes, CRC/protocol errors, packet-sequence gaps, last sequence, and observed experiment hash. The host records serial-read-to-CSV-write pipeline latency and host/device recording-span skew. The manifest keeps configured and observed send settings separately so configuration drift is visible. Per-recording summaries include the number of telemetry samples, maximum observed queue depth, and minimum observed free heap. The queue high-water and minimum-free-heap counters are explicitly marked as since-boot values. Device callback/drop deltas use the nearest available 1 Hz telemetry snapshots, so they are approximate at recording boundaries, especially for short trials.
 
 For research-transmitter sessions, set `send_mode` to `espnow_research` and make `transmitter_experiment_id` equal the ID configured with the transmitter's `research_tx` command. Session validation fails if no independently validated research frame is observed, the FNV-1a experiment hash differs, or no valid packet arrives inside the recording. Receiver application goodput is `8 * receiver_research_bytes_delta / recording_duration`; transmitter callback success is only local MAC status and must not be reported as delivery. The embedded `tx_timestamp_us` is transmitter uptime on an unsynchronized monotonic clock, so it does not by itself establish one-way latency.
 
@@ -28,7 +28,7 @@ Copy the example without putting names, e-mail addresses, or other direct identi
 Copy-Item tools\config\experiment_config.example.json tools\config\experiment_config.json
 ```
 
-Change at least `participant_id`, `session_id`, `date`, `room_id`, `receiver_id`, device placement, orientation, distance, sending mode, and sending interval. Use a new `session_id` whenever the participant, date, room, device geometry, radio configuration, or collection block changes materially.
+Change at least `participant_id`, `session_id`, `date`, `room_id`, `site_id`, `receiver_id`, `router_id`, `target_mac`, device placement, orientation, distance, sending mode, and sending interval. `device_pair_id` identifies the receiver plus router/sender domain. Use a new `session_id` whenever the participant, date, room, device pair, geometry, target MAC, radio configuration, or collection block changes materially.
 
 Recommended session ID pattern:
 
@@ -93,7 +93,9 @@ python validate_session.py data\R01\2026-09-01
 
 The room/day manifest is an archive index and may contain multiple sessions. Filter one `session_id` before strict core-action coverage validation. See [tools/data/README.md](tools/data/README.md) for file naming, field semantics, and loading examples.
 
-The validator checks required domain keys, duplicate recording IDs and paths, action coverage, sidecars, CSV hashes, frame counts, sequence gaps, explicit fall semantics, and configured-versus-observed sending settings. It writes `validation_report.json` and exits nonzero on failure.
+Before activity trials, use the GUI's **Record 60 s baseline** control. The collector blocks `activity` recordings until the same session contains a qualified `static_reference`. Each recording reports target-MAC fraction, unexpected-MAC count, dominant PHY signature/fraction, PHY switches, and an explicit quality status. Protocol 1.1 requires at least 95% target-MAC frames and 95% one dominant PHY signature by default. Raw rows remain intact for audit; failed recordings are excluded by validation rather than silently filtered.
+
+The validator checks required domain keys, duplicate recording IDs and paths, action coverage, sidecars, CSV hashes, frame counts, sequence gaps, target-MAC purity, PHY stability, static-baseline readiness, explicit fall semantics, and configured-versus-observed sending settings. It writes `validation_report.json`, includes group-split keys, and exits nonzero on failure.
 Interrupted recordings are retained with `status=aborted` for diagnosis, but validation fails until they are excluded or recollected. The manifest and sidecar also store hashes for the experiment config and collector plus firmware/chip revision fields reported by `DEVICE_INFO`.
 
 ## Collection design

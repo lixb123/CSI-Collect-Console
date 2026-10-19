@@ -58,6 +58,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         xEventGroupClearBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "sta disconnected, reason=%d", event ? event->reason : -1);
         if (s_reconnect) {
             ESP_LOGI(TAG, "sta disconnect, s_reconnect...");
             esp_wifi_connect();
@@ -125,7 +127,10 @@ static int wifi_cmd_sta(int argc, char **argv)
         s_reconnect = false;
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_ERROR_CHECK(esp_wifi_disconnect());
-        xEventGroupWaitBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT, false, true, portMAX_DELAY);
+        if (!(xEventGroupWaitBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT, false, true,
+                                  pdMS_TO_TICKS(5000)) & WIFI_DISCONNECTED_BIT)) {
+            ESP_LOGW(TAG, "Timed out waiting for Wi-Fi disconnect");
+        }
     }
 
     s_reconnect = true;
@@ -134,7 +139,11 @@ static int wifi_cmd_sta(int argc, char **argv)
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
     esp_wifi_connect();
 
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, false, true, pdMS_TO_TICKS(5000));
+    if (!(xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, false, true,
+                              pdMS_TO_TICKS(8000)) & WIFI_CONNECTED_BIT)) {
+        ESP_LOGE(TAG, "Wi-Fi connection timed out (check SSID/password, 2.4 GHz AP, and signal)");
+        return ESP_ERR_TIMEOUT;
+    }
 
     return ESP_OK;
 }
@@ -313,11 +322,13 @@ static int wifi_config_func(int argc, char **argv)
     }
 
     if (wifi_config_args.ssid->count) {
-        strcpy((char *)wifi_config.sta.ssid, wifi_config_args.ssid->sval[0]);
+        strlcpy((char *)wifi_config.sta.ssid, wifi_config_args.ssid->sval[0],
+                sizeof(wifi_config.sta.ssid));
     }
 
     if (wifi_config_args.password->count) {
-        strcpy((char *)wifi_config.sta.password, wifi_config_args.password->sval[0]);
+        strlcpy((char *)wifi_config.sta.password, wifi_config_args.password->sval[0],
+                sizeof(wifi_config.sta.password));
     }
 
     if (wifi_config_args.bssid->count) {
@@ -334,7 +345,10 @@ static int wifi_config_func(int argc, char **argv)
             s_reconnect = false;
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             ESP_ERROR_CHECK(esp_wifi_disconnect());
-            xEventGroupWaitBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT, false, true, portMAX_DELAY);
+            if (!(xEventGroupWaitBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT, false, true,
+                                      pdMS_TO_TICKS(5000)) & WIFI_DISCONNECTED_BIT)) {
+                ESP_LOGW(TAG, "Timed out waiting for Wi-Fi disconnect");
+            }
         }
 
         s_reconnect = true;
@@ -350,7 +364,11 @@ static int wifi_config_func(int argc, char **argv)
 
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         esp_wifi_connect();
-        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, false, true, pdMS_TO_TICKS(5000));
+        if (!(xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, false, true,
+                                  pdMS_TO_TICKS(8000)) & WIFI_CONNECTED_BIT)) {
+            ESP_LOGE(TAG, "Wi-Fi connection timed out (check SSID/password, 2.4 GHz AP, and signal)");
+            return ESP_ERR_TIMEOUT;
+        }
     }
 
     if (wifi_config_args.country_code->count) {
@@ -540,6 +558,8 @@ static esp_err_t wifi_scan_func(int argc, char **argv)
 
     for (int i = 0; i < ap_number; i++) {
         memset(&ap_record, 0, sizeof(wifi_ap_record_t));
+
+        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_record(&ap_record));
 
         if (ap_record.rssi < filter_rssi) {
             continue;

@@ -1,6 +1,7 @@
 {
   "router_ssid": "",
   "router_password": "",
+  "remember_password": false,
   "router_auto_connect": false,
   "display_raw_data": true,
   "display_radar_model": true,
@@ -8,13 +9,19 @@
   "participant_id": "P001",
   "room_id": "R01",
   "receiver_id": "ESP32-RX-01",
+  "session_id": "",
+  "router_id": "AP-01",
+  "sender_id": "",
+  "target_mac": "",
+  "data_root": "data",
   "distance_m": 3.0,
   "serial_port": "",
   "language": "en",
+  "collection_item": "empty_room_reference",
   "collect_action": "none",
   "collect_wait_seconds": 3,
   "collect_duration_seconds": 3,
   "collect_number": 1,
   "complex_csi_enabled": true,
-  "calibration_role": "activity"
+  "calibration_role": "empty_room_reference"
 }

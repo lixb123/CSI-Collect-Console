@@ -49,6 +49,19 @@ SSID 和密码。发射端会按 `RESEARCH_TX_SEND_INTERVAL_MS` 向 SoftAP 子�
 
 ## 串口配置
 
+### ESP-NOW 研究发射角色
+
+若接收端选择 `espnow_research`，发射端必须使用独立配置构建：
+
+```powershell
+idf.py -B build-espnow -D IDF_TARGET=esp32s3 -D SDKCONFIG=sdkconfig.espnow -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.espnow.defaults" build
+```
+
+该配置使用固定源 MAC `1a:00:00:00:00:00`、信道 11 和带序号/CRC 的研究帧。发射端的
+`RESEARCH_TX_EXPERIMENT_ID` 或运行时 `research_tx --experiment_id` 必须与 GUI session 的
+`transmitter_experiment_id` 相同。SoftAP 与 ESP-NOW 是互斥的编译期角色；SoftAP 发射端
+继续配合 Router Ping，不会被这个模式改动。
+
 固件默认自动发送。建议每个 session 开始前先停止、配置并清零：
 
 ```text

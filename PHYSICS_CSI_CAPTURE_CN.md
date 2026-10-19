@@ -2,14 +2,22 @@
 
 ## 已经具备的能力
 
-接收端原始 `data` 保存 ESP-IDF 的有符号 CSI 字节，顺序为 `[imag, real, imag, real, ...]`。本次增强把布局、LTF、滤波/缩放、校准角色和相位质量显式写入 manifest/sidecar，并在 GUI 提供“保存复数 I/Q”和校准角色选择。
+接收端原始 `data` 保存 ESP-IDF 的有符号 CSI 字节，顺序为 `[imag, real, imag, real, ...]`。本次增强把布局、LTF、滤波/缩放、校准角色和相位质量显式写入 manifest/sidecar，并在 GUI 提供“保存复数 I/Q”。校准角色由“采集项目”及其右侧的静态基线按钮自动映射，不再单独选择。
 
-- 接收固件 `radar --physics_mode`：关闭相邻子载波平滑和手动 bit shift，保留 signed I/Q，输出 base64；
+- 接收固件 `radar --physics_mode`：关闭 esp-radar 软件增益补偿、相邻子载波平滑和手动 bit shift，保留 signed I/Q，输出 base64；
 - 普通路由器：AI 主实验的默认发射源；固定型号、信道、带宽、位置和 router-ping/null-data 间隔即可；
 - 可选 ESP32 发射固件 `research_tx --physics_probe --probe_id N`：只用于需要包标记或通信遥测的 ISAC/ISCC 对照；
 - GUI：`物理 CSI / Physics CSI` 开关与动作/空房/静止人员参考角色；
 - sidecar/manifest：I/Q 顺序、复数子载波数、低幅值比例、去线性趋势相位统计和 `phase_quality_status`；
 - `tools/complex_csi.py`：Im/Re 解析、相位展开、每帧线性相位去除和审计。
+
+## AGC 与 DSP 约定
+
+- 不把硬件 AGC 当作可关闭的采集选项。ESP32 CSI 回调给出的 `agc_gain`/`fft_gain` 是接收状态，应原样记录并用于质量诊断。
+- `radar --physics_mode` 设置 `csi_compensate_en=0`、`channel_filter_en=0`、`manu_scale=0` 和 `shift=0`。采集端不做不可逆的增益补偿或平滑。
+- 采集端不做滑动平均、异常值替换或相位“校正”。需要滤波时，在训练折内部离线应用，并保存窗口长度、截止频率和边界处理。
+- 同时保留 raw amplitude 与逐帧 RMS 归一化 amplitude。归一化能减小 AGC/路径损耗的共同缩放，但会丢失绝对功率信息，不能替代原始质量字段。
+- 每次采集后统计 `rate`、`sig_mode`、`mcs`、带宽、`channel_secondary`、`len`、`rssi`、`agc_gain`、包间隔和 `±127/128` 饱和率。先处理削顶和 PHY 切换，不用滤波掩盖它们。
 
 ## 相位限制
 

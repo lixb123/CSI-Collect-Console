@@ -76,6 +76,12 @@ static const char *TAG                   = "app_main";
 static volatile uint32_t g_csi_received_count = 0;
 static volatile uint32_t g_csi_queue_drop_count = 0;
 static volatile uint32_t g_csi_queue_high_water = 0;
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
+/* Cumulative Null Data trigger counters, exposed through SYSTEM_TELEMETRY. */
+static volatile uint32_t g_null_tx_count = 0;
+static volatile uint32_t g_null_tx_error_count = 0;
+static volatile uint32_t g_null_ack_or_response_count = 0;
+#endif
 static volatile uint32_t g_research_rx_valid = 0;
 static volatile uint32_t g_research_rx_crc_errors = 0;
 static volatile uint32_t g_research_rx_other_errors = 0;
@@ -194,13 +200,34 @@ static research_frame_result_t decode_research_payload(
 
 void wifi_csi_raw_cb(void *ctx, const wifi_csi_filtered_info_t *info)
 {
+#if CONFIG_RESEARCH_RX_ESPNOW_MODE
+    bool valid_research_frame = false;
+#endif
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
+    /* Promiscuous CSI reception can continue after STA disassociation. Do not
+     * expose nearby traffic as connected-AP CSI while Wi-Fi is disconnected. */
+    if (!g_wifi_connect_status) {
+        return;
+    }
+#endif
     g_csi_received_count++;
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
+    /* Count every filtered CSI callback observed while the Null Data trigger
+     * is active. ESP32-S3 does not expose a reliable per-TX ACK identifier,
+     * so this is a response candidate count rather than an ACK guarantee. */
+    if (g_trigger_mode == CSI_TRIGGER_NULL_DATA) {
+        g_null_ack_or_response_count++;
+    }
+#endif
     if (info->info && info->info->payload && info->info->payload_len >= research_frame_header_size()) {
         research_frame_header_t header;
         research_frame_result_t result = decode_research_payload(
             info->info->payload, info->info->payload_len, &header);
         portENTER_CRITICAL(&g_research_rx_lock);
         if (result == RESEARCH_FRAME_OK) {
+#if CONFIG_RESEARCH_RX_ESPNOW_MODE
+            valid_research_frame = true;
+#endif
             if (g_research_rx_has_seq && header.experiment_hash == g_research_rx_experiment_hash &&
                     header.packet_seq > g_research_rx_last_seq + 1) {
                 g_research_rx_seq_gaps += header.packet_seq - g_research_rx_last_seq - 1;
@@ -220,6 +247,12 @@ void wifi_csi_raw_cb(void *ctx, const wifi_csi_filtered_info_t *info)
         }
         portEXIT_CRITICAL(&g_research_rx_lock);
     }
+#if CONFIG_RESEARCH_RX_ESPNOW_MODE
+    /* Never expose unrelated or corrupt payloads as dedicated research CSI. */
+    if (!valid_research_frame) {
+        return;
+    }
+#endif
     wifi_csi_filtered_info_t *q_data = malloc(sizeof(wifi_csi_filtered_info_t) + info->valid_len);
     if (!q_data) {
         g_csi_queue_drop_count++;
@@ -244,7 +277,7 @@ static void system_telemetry_task(void *arg)
 {
     printf("type,device_uptime_ms,csi_received,queue_drops,queue_depth,queue_high_water,free_heap,minimum_free_heap,send_interval_ms,send_mode,"
            "research_rx_valid,research_rx_crc_errors,research_rx_other_errors,research_rx_seq_gaps,research_rx_bytes,"
-           "research_rx_last_seq,research_rx_experiment_hash\n");
+           "research_rx_last_seq,research_rx_experiment_hash,null_tx_count,null_tx_error_count,null_ack_or_response_count,wifi_connected\n");
     while (true) {
 #if CONFIG_RESEARCH_RX_ESPNOW_MODE
         const char *send_mode = "espnow_research";
@@ -268,13 +301,19 @@ static void system_telemetry_task(void *arg)
         research_last_seq = g_research_rx_last_seq;
         research_experiment_hash = g_research_rx_experiment_hash;
         portEXIT_CRITICAL(&g_research_rx_lock);
-        printf("SYSTEM_TELEMETRY,%u,%u,%u,%u,%u,%u,%u,%u,%s,%u,%u,%u,%u,%" PRIu64 ",%u,%u\n",
+        printf("SYSTEM_TELEMETRY,%u,%u,%u,%u,%u,%u,%u,%u,%s,%u,%u,%u,%u,%" PRIu64 ",%u,%u,%u,%u,%u,%u\n",
                esp_log_timestamp(), g_csi_received_count, g_csi_queue_drop_count,
                queue_depth, g_csi_queue_high_water,
                esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                g_send_data_interval, send_mode, research_valid, research_crc_errors,
                research_other_errors, research_seq_gaps, research_bytes,
-               research_last_seq, research_experiment_hash);
+               research_last_seq, research_experiment_hash,
+#if CONFIG_RESEARCH_RX_ESPNOW_MODE
+               0U, 0U, 0U, 0U);
+#else
+               g_null_tx_count, g_null_tx_error_count, g_null_ack_or_response_count,
+               g_wifi_connect_status ? 1U : 0U);
+#endif
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -287,7 +326,8 @@ static void collect_timercb(TimerHandle_t timer)
         xTimerStop(g_collect_timer_handele, 0);
         xTimerDelete(g_collect_timer_handele, 0);
         g_collect_timer_handele = NULL;
-        strcpy(g_console_input_config.collect_taget, "unknown");
+        strlcpy(g_console_input_config.collect_taget, "unknown",
+                sizeof(g_console_input_config.collect_taget));
         return;
     }
 }
@@ -346,7 +386,9 @@ static int wifi_cmd_radar(int argc, char **argv)
 
     if (radar_args.collect_taget->count && radar_args.collect_number->count && radar_args.collect_duration->count) {
         g_console_input_config.collect_number = radar_args.collect_number->ival[0];
-        strcpy(g_console_input_config.collect_taget, radar_args.collect_taget->sval[0]);
+        strlcpy(g_console_input_config.collect_taget,
+                radar_args.collect_taget->sval[0],
+                sizeof(g_console_input_config.collect_taget));
 
         if (g_collect_timer_handele) {
             xTimerStop(g_collect_timer_handele, portMAX_DELAY);
@@ -359,7 +401,9 @@ static int wifi_cmd_radar(int argc, char **argv)
     }
 
     if (radar_args.csi_output_format->count) {
-        strcpy(g_console_input_config.csi_output_format, radar_args.csi_output_format->sval[0]);
+        strlcpy(g_console_input_config.csi_output_format,
+                radar_args.csi_output_format->sval[0],
+                sizeof(g_console_input_config.csi_output_format));
     }
 
     if (radar_args.csi_output_type->count) {
@@ -370,14 +414,9 @@ static int wifi_cmd_radar(int argc, char **argv)
             radar_config.csi_config.csi_filtered_cb = NULL;
         } else {
             radar_config.csi_config.csi_filtered_cb = wifi_csi_raw_cb;
-            strcpy(g_console_input_config.csi_output_type, radar_args.csi_output_type->sval[0]);
-#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
-            /* The GUI restarts radar with a fresh config.  Connected-AP mode
-             * must keep an empty source filter so router and SoftAP frames
-             * are both accepted after that restart. */
-            memset(radar_config.csi_config.filter_mac, 0,
-                   sizeof(radar_config.csi_config.filter_mac));
-#endif
+            strlcpy(g_console_input_config.csi_output_type,
+                    radar_args.csi_output_type->sval[0],
+                    sizeof(g_console_input_config.csi_output_type));
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
             if (!strcasecmp(radar_args.csi_output_type->sval[0], "LLTF")) {
                 radar_config.csi_config.acquire_csi_lltf = true;
@@ -463,7 +502,7 @@ static int wifi_cmd_radar(int argc, char **argv)
         radar_config.csi_config.csi_recv_interval = g_send_data_interval;
         esp_radar_change_config(&radar_config);
 
-#if !WIFI_CSI_SEND_NULL_DATA_ENABLE
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE && !WIFI_CSI_SEND_NULL_DATA_ENABLE
         /* A running ping session copies interval_ms at creation time. Recreate
          * it so the observed device setting matches the actual packet rate. */
         if (g_wifi_connect_status) {
@@ -491,13 +530,25 @@ static int wifi_cmd_radar(int argc, char **argv)
     if (radar_args.physics_mode->count) {
         esp_radar_config_t radar_config = {0};
         esp_radar_get_config(&radar_config);
+        bool needs_change = radar_config.csi_config.channel_filter_en ||
+                            radar_config.csi_config.csi_compensate_en ||
+                            radar_config.csi_config.manu_scale ||
+                            radar_config.csi_config.shift != 0 ||
+                            radar_config.csi_config.csi_filtered_cb != wifi_csi_raw_cb;
         radar_config.csi_config.channel_filter_en = false;
+        /* Keep signed CSI reproducible for offline fall detection features.
+         * Hardware AGC remains active and is recorded in rx_ctrl_info, but
+         * do not apply the esp-radar software gain compensation here. */
+        radar_config.csi_config.csi_compensate_en = false;
         radar_config.csi_config.manu_scale = false;
         radar_config.csi_config.shift = 0;
         radar_config.csi_config.csi_filtered_cb = wifi_csi_raw_cb;
-        esp_radar_change_config(&radar_config);
-        strcpy(g_console_input_config.csi_output_format, "base64");
-        ESP_LOGW(TAG, "physics_mode: raw signed I/Q enabled, component order=[imag,real], channel_filter=0, manual_scale=0; absolute phase is not calibrated");
+        if (needs_change) {
+            esp_radar_change_config(&radar_config);
+        }
+        strlcpy(g_console_input_config.csi_output_format, "base64",
+                sizeof(g_console_input_config.csi_output_format));
+        ESP_LOGW(TAG, "physics_mode: raw signed I/Q enabled, component order=[imag,real], channel_filter=0, software_gain_compensation=0, manual_scale=0; hardware AGC is recorded; absolute phase is not calibrated");
     }
 
     return ESP_OK;
@@ -551,12 +602,18 @@ static void csi_data_print_task(void *arg)
     static uint32_t count = 0;
 
     while (xQueueReceive(g_csi_info_queue, &info, portMAX_DELAY)) {
+#if !CONFIG_RESEARCH_RX_ESPNOW_MODE
+        if (!g_wifi_connect_status) {
+            free(info);
+            continue;
+        }
+#endif
         size_t len = 0;
         esp_radar_rx_ctrl_info_t *rx_ctrl = &info->rx_ctrl_info;
 
         if (!count) {
             ESP_LOGI(TAG, "================ CSI RECV ================");
-            len += sprintf(buffer + len, "type,sequence,timestamp,taget_seq,target,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_state,agc_gain,fft_gain,len,first_word,data\n");
+            len += sprintf(buffer + len, "type,sequence,timestamp,taget_seq,target,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_state,agc_gain,fft_gain,rx_seq,len,first_word,data\n");
         }
         uint16_t valid_len = info->valid_len;
         if (!strcasecmp(g_console_input_config.csi_output_type, "LLTF")) {
@@ -577,13 +634,14 @@ static void csi_data_print_task(void *arg)
             info->valid_len = valid_len;
 
         }
-        len += sprintf(buffer + len, "CSI_DATA,%d,%u,%u,%s," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,",
+        len += sprintf(buffer + len, "CSI_DATA,%d,%u,%u,%s," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%u,%d,%d,",
                        count++, esp_log_timestamp(), g_console_input_config.collect_number, g_console_input_config.collect_taget,
                        MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate, rx_ctrl->signal_mode,
                        rx_ctrl->mcs, rx_ctrl->cwb, 0, 0,
                        0, rx_ctrl->stbc, 0, 0,
                        rx_ctrl->noise_floor, 0, rx_ctrl->channel, rx_ctrl->secondary_channel,
-                       rx_ctrl->timestamp, 0, 0, 0, rx_ctrl->agc_gain, rx_ctrl->fft_gain, info->valid_len, 0);
+                       rx_ctrl->timestamp, 0, 0, 0, rx_ctrl->agc_gain, rx_ctrl->fft_gain,
+                       info->rx_seq, info->valid_len, 0);
 
         if (!strcasecmp(g_console_input_config.csi_output_format, "base64")) {
             size_t size = 0;
@@ -750,22 +808,42 @@ static void trigger_router_send_data_task(void *arg)
                 wifi_ap_record_t ap_info = {0};
                 uint8_t sta_mac[6] = {0};
                 esp_radar_get_config(&radar_config);
-                esp_wifi_sta_get_ap_info(&ap_info);
+                if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK ||
+                        memcmp(ap_info.bssid, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
+                    ESP_LOGW(TAG, "Cannot read connected AP information; delaying NULL-data trigger");
+                    vTaskDelay(pdMS_TO_TICKS(g_send_data_interval));
+                    continue;
+                }
                 ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, sta_mac));
-                memset(radar_config.csi_config.filter_mac, 0, sizeof(radar_config.csi_config.filter_mac));
-                memcpy(radar_config.csi_config.filter_dmac, sta_mac, sizeof(sta_mac));
+                /* Capture ACK/NULL-data CSI addressed to this station.  The
+                 * radar component's legacy empty-MAC rule assumes a fixed
+                 * payload_len of 14, but ESP32-S3 ACK CSI reports vary by AP;
+                 * use destination-MAC filtering instead. */
+                memset(radar_config.csi_config.filter_mac, 0xFF,
+                       sizeof(radar_config.csi_config.filter_mac));
+                /* Do not require a fixed destination MAC: ACK metadata differs
+                 * across APs and drivers.  dump_ack_en keeps ACK CSI enabled. */
+                radar_config.csi_config.filter_dmac_flag = false;
+                /* Keep the serial CSI callback enabled even when the mode
+                 * command arrives before the GUI's output-type command. */
+                radar_config.csi_config.csi_filtered_cb = wifi_csi_raw_cb;
                 radar_config.csi_config.csi_recv_interval = g_send_data_interval;
                 radar_config.csi_config.dump_ack_en = true;
                 esp_radar_change_config(&radar_config);
                 memcpy(null_data.destination_address, ap_info.bssid, 6);
                 memcpy(null_data.broadcast_address, ap_info.bssid, 6);
                 memcpy(null_data.source_address, sta_mac, 6);
-                ESP_ERROR_CHECK(esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M));
+                esp_err_t rate_ret = esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);
+                if (rate_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Unable to set NULL-data TX rate: %s", esp_err_to_name(rate_ret));
+                }
                 ESP_LOGI(TAG, "CSI trigger mode active: null_data");
                 active_mode = CSI_TRIGGER_NULL_DATA;
             }
+            g_null_tx_count++;
             esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_STA, &null_data, sizeof(null_data), true);
             if (ret != ESP_OK) {
+                g_null_tx_error_count++;
                 ESP_LOGW(TAG, "esp_wifi_80211_tx, %s", esp_err_to_name(ret));
             }
             vTaskDelay(pdMS_TO_TICKS(g_send_data_interval));
@@ -778,7 +856,17 @@ static void trigger_router_send_data_task(void *arg)
             esp_netif_ip_info_t local_ip = {0};
             esp_radar_get_config(&radar_config);
             esp_wifi_sta_get_ap_info(&ap_info);
-            memset(radar_config.csi_config.filter_mac, 0, sizeof(radar_config.csi_config.filter_mac));
+            /* router_ping uses ordinary data frames, so do not retain the
+             * empty filter_mac that is reserved for NULL-data ACK capture. */
+            memset(radar_config.csi_config.filter_mac, 0xFF,
+                   sizeof(radar_config.csi_config.filter_mac));
+            radar_config.csi_config.filter_dmac_flag = false;
+            radar_config.csi_config.csi_filtered_cb = wifi_csi_raw_cb;
+            /* Keep ACK CSI enabled for Router Ping.  The ping request is
+             * short and the AP's ACK is often the dominant CSI-bearing
+             * response; disabling it makes the apparent sample rate depend
+             * on unrelated AP data traffic. */
+            radar_config.csi_config.dump_ack_en = true;
             radar_config.csi_config.csi_recv_interval = g_send_data_interval;
             esp_radar_change_config(&radar_config);
             esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &local_ip);
@@ -805,7 +893,6 @@ static void trigger_router_send_data_task(void *arg)
     g_trigger_task_handle = NULL;
     vTaskDelete(NULL);
 #else
-    g_trigger_task_handle = NULL;
     vTaskDelete(NULL);
 #endif
 }
@@ -816,17 +903,20 @@ static void print_device_info(const ip_event_got_ip_t *event)
     esp_chip_info_t chip_info = {0};
     const esp_app_desc_t *app_desc = esp_app_get_description();
     char ssid[sizeof(wifi_config.sta.ssid) + 1] = {0};
+    uint8_t sta_mac[6] = {0};
 
     ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
     memcpy(ssid, wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid));
     esp_chip_info(&chip_info);
+    ESP_ERROR_CHECK(esp_read_mac(sta_mac, ESP_MAC_WIFI_STA));
 
-    printf("DEVICE_INFO,%u,\"%s %s\",ESP32-S3,%u,%s,%s,%u,%u,\"%s\"," IPSTR ",0\n",
+    printf("DEVICE_INFO,%u,\"%s %s\",ESP32-S3,%u,%s,%s,%u,%u,\"%s\"," IPSTR ",0,"
+           MACSTR ",csi-multisite-v1\n",
            esp_log_timestamp(), __DATE__, __TIME__, chip_info.revision,
            app_desc ? app_desc->version : "unknown",
            app_desc ? app_desc->idf_ver : "unknown",
            heap_caps_get_total_size(MALLOC_CAP_DEFAULT), esp_get_free_heap_size(), ssid,
-           IP2STR(&event->ip_info.ip));
+           IP2STR(&event->ip_info.ip), MAC2STR(sta_mac));
 }
 
 /* Event handler for catching system events */
@@ -851,8 +941,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 #endif
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         g_wifi_connect_status = false;
+        uint32_t discarded = 0;
+        wifi_csi_filtered_info_t *queued_info = NULL;
+        while (g_csi_info_queue && xQueueReceive(g_csi_info_queue, &queued_info, 0) == pdTRUE) {
+            free(queued_info);
+            queued_info = NULL;
+            discarded++;
+        }
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d", event ? (int)event->reason : -1);
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d, discarded_pending_csi=%u",
+                 event ? (int)event->reason : -1, discarded);
     }
 }
 esp_err_t ws2812_led_init(void)
@@ -936,13 +1034,20 @@ void app_main(void)
     esp_radar_wifi_config_t wifi_config = ESP_RADAR_WIFI_CONFIG_DEFAULT();
     esp_radar_dec_config_t dec_config = ESP_RADAR_DEC_CONFIG_DEFAULT();
 #if WIFI_CSI_SEND_NULL_DATA_ENABLE
-    /* Null-data replies are MAC ACK frames, not packets from a fixed peer. */
-    memset(csi_config.filter_mac, 0, sizeof(csi_config.filter_mac));
-    csi_config.dump_ack_en       = true;
+    /* Capture ACK/NULL-data CSI from the connected AP.  An all-zero
+     * filter_mac activates the legacy payload_len==14 rule in older
+     * esp-radar builds, which rejects valid ESP32-S3 ACK reports.  Use the
+     * explicit wildcard instead and let the trigger task select the mode. */
+    memset(csi_config.filter_mac, 0xFF, sizeof(csi_config.filter_mac));
+    csi_config.filter_dmac_flag = false;
+    csi_config.dump_ack_en      = true;
 #else
     memcpy(csi_config.filter_mac, "\x1a\x00\x00\x00\x00\x00", 6);
 #endif
     csi_config.csi_recv_interval = g_send_data_interval;
+    /* Fall-detection capture keeps hardware AGC active, but stores the CSI
+     * before esp-radar's optional software gain compensation. */
+    csi_config.csi_compensate_en = false;
     dec_config.wifi_radar_cb     = wifi_radar_cb;
     dec_config.outliers_threshold = 0;
     ESP_ERROR_CHECK(esp_radar_wifi_init(&wifi_config));

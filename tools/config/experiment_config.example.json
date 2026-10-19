@@ -4,12 +4,27 @@
   "transmitter_experiment_id": "P001-R01-D01-S01",
   "date": "2026-09-01",
   "room_id": "R01",
+  "site_id": "SITE-01",
   "receiver_id": "ESP32-RX-01",
   "sender_id": "",
   "router_id": "AP-01",
-  "router_position": {"x_m": 0.0, "y_m": 0.0, "z_m": 1.2},
-  "receiver_position": {"x_m": 3.0, "y_m": 0.0, "z_m": 1.2},
-  "sender_position": {"x_m": 0.0, "y_m": 0.0, "z_m": 1.2},
+  "target_mac": "",
+  "device_pair_id": "ESP32-RX-01__AP-01",
+  "router_position": {
+    "x_m": 0.0,
+    "y_m": 0.0,
+    "z_m": 1.2
+  },
+  "receiver_position": {
+    "x_m": 3.0,
+    "y_m": 0.0,
+    "z_m": 1.2
+  },
+  "sender_position": {
+    "x_m": 0.0,
+    "y_m": 0.0,
+    "z_m": 1.2
+  },
   "orientation": "participant_faces_receiver",
   "distance_m": 3.0,
   "scenario": "furnished_room",
@@ -17,6 +32,11 @@
   "interference_condition": "normal",
   "send_mode": "router_ping",
   "send_interval_ms": 10,
+  "require_static_baseline": true,
+  "baseline_min_duration_s": 60,
+  "minimum_target_mac_fraction": 0.95,
+  "minimum_dominant_phy_fraction": 0.95,
+  "minimum_telemetry_samples": 1,
   "csi_output_type": "LLTF",
   "complex_csi_enabled": true,
   "csi_component_order": "imag_real_interleaved",
@@ -27,5 +47,12 @@
   "fall_type": "demonstrated_fall",
   "trial_id_prefix": "P001-R01-S01-",
   "collector_version": "console-csi-v7-research",
-  "notes": "AI main experiment: use a fixed ordinary router. Use pseudonymous participant IDs and record every action in every session."
+  "notes": "AI main experiment: use a fixed ordinary router. Use pseudonymous participant IDs and record every action in every session.",
+  "acquisition_gate_enabled": true,
+  "target_only_recordings": true,
+  "minimum_target_rate_hz": 50.0,
+  "maximum_target_gap_ms": 100.0,
+  "mode_settle_seconds": 3.0,
+  "allow_null_data_collection": false,
+  "quality_policy_version": "target-link-v1"
 }

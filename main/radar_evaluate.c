@@ -204,12 +204,21 @@ static void tcp_server_task(void *arg)
                 while (buf_size > 250) {
                     char *begin = strstr(rx_buffer, "CSI_DATA");
                     char *end   = strstr(rx_buffer, "\n");
+                    if (!begin || !end || end <= begin) {
+                        if (!end) {
+                            break;
+                        }
+                        buf_size -= (end + 1 - rx_buffer);
+                        memmove(rx_buffer, end + 1, buf_size);
+                        rx_buffer[buf_size] = '\0';
+                        continue;
+                    }
                     ssize_t size  = end - begin;
 
                     // ESP_LOGW("TAG", "begin: %p, end: %p, size: %d", begin, end, size);
                     // ESP_LOGW(TAG, "size: %d, received: %d, buf_size: %d", size, len, buf_size);
 
-                    if (begin && end && size > 250) {
+                    if (size > 250) {
                         begin[size] = '\0';
                         csi_info_analysis(begin, size);
                     }

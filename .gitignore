@@ -6,6 +6,8 @@ sdkconfig
 sdkconfig.old
 csi_send/sdkconfig
 csi_send/sdkconfig.old
+sdkconfig.espnow
+csi_send/sdkconfig.espnow
 
 # Local editor and Python files
 .vscode/
@@ -19,6 +21,8 @@ venv/
 # Personal configuration: may contain a Wi-Fi password
 tools/config/gui_config.json
 tools/config/experiment_config.json
+tools/config/gui_config.share.json
+tools/config/sessions/
 # Older launches from the repository root wrote the same local preference here.
 config/gui_config.json
 
@@ -26,6 +30,7 @@ config/gui_config.json
 tools/data/*
 !tools/data/README.md
 tools/log/
+tools/ab_test_*/
 
 # OS/editor temporary files
 .DS_Store

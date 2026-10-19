@@ -1,6 +1,6 @@
 # CSI-Collect-Console
 
-[English](README.md) · [研究采集设计](RESEARCH_CAPTURE.md) · [复数 I/Q 物理采集](PHYSICS_CSI_CAPTURE_CN.md) · [数据格式详解](tools/data/README.md)
+[English](README.md) · [研究采集设计](RESEARCH_CAPTURE.md) · [采集质量](tools/COLLECTION_QUALITY.md) · [复数 I/Q 物理采集](PHYSICS_CSI_CAPTURE_CN.md) · [数据格式详解](tools/data/README.md)
 
 `CSI-Collect-Console` 是面向 AI、ISAC 和 ISCC 实验的 ESP32-S3 Wi-Fi CSI 采集系统，包括：
 
@@ -10,18 +10,20 @@
 - 中英文界面、参数记忆、等待/采集双倒计时和规范化实验元数据；
 - 可运行时切换 `router_ping` 与 `null_data`，切换触发方式不需要重新烧录接收端；
 - 可选的 ESP32-S3 SoftAP 发射端，使用现有 SSID/密码输入框即可切换；
-- 按地点和日期归档的 CSV、逐记录 sidecar 与日清单。
+- 按地点和日期归档的 CSV、逐记录 sidecar、日清单及目标链路质量门禁。
 
-采集后的清洗、质量控制、模型训练、基准、图片和论文处理结果位于 [lixb123/esp-csi-fall-detection](https://github.com/lixb123/esp-csi-fall-detection)。本仓库负责采集，后者负责数据处理与实验结果。后者的早期发布使用 `wave/move/static/none/front/after` 旧标签，新采集的细粒度动作必须显式映射。
+历史数据清洗与基准结果位于 [Leakage-Aware Selective Learning for Resource-Constrained Wi-Fi CSI Fall Detection](https://github.com/lixb123/Leakage-Aware-Selective-Learning-for-Resource-Constrained-Wi-Fi-CSI-Fall-Detection)。本仓库负责采集。历史发布使用 `wave/move/static/none/front/after` 旧标签，新采集的细粒度动作必须显式映射。
 
 ## 环境和设备
 
-- 两块 ESP32-S3 开发板，分别作为 TX 与 RX；
-- 两路 USB/UART，接收端 GUI 使用 2,000,000 波特率；
+- 默认采集使用一块 ESP32-S3 接收板与固定路由器；研究发射板可选；
+- 接收端 USB/UART 使用 2,000,000 波特率；可选发射板需要第二路连接；
 - ESP-IDF 5.5.5；依赖锁定的 `esp-radar` 至少要求 ESP-IDF 5.4；
 - Python 3.10+，依赖见 `tools/requirements.txt`。
 
-研究发射端与接收端默认使用源 MAC `1a:00:00:00:00:00` 和 Wi-Fi 信道 11，两端信道必须一致。
+ESP-NOW 研究模式使用源 MAC `1a:00:00:00:00:00` 和默认信道 11；使用此模式时两端信道必须一致。
+
+接收端通过[仓库内固定的 esp-radar 0.3.4 补丁](vendor/esp-radar/PATCHES.md)保留 `rx_seq` 与已验证的 ACK 过滤行为；该目录保留上游许可证。
 
 ## 克隆项目
 
@@ -43,7 +45,14 @@ idf.py -B build-research-s3 build
 idf.py -B build-research-s3 -p COM_TX flash monitor
 ```
 
-把 `COM_TX` 替换为发射端 UART 端口。在 monitor 中为每个 session 配置实验 ID：
+把 `COM_TX` 替换为发射端 UART 端口。上述命令编译默认 SoftAP profile，适用于路由器连接采集。使用 ESP-NOW 研究发射端时，先编译并烧录专用 profile：
+
+```powershell
+idf.py -B build-espnow -D IDF_TARGET=esp32s3 -D SDKCONFIG=sdkconfig.espnow -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.espnow.defaults" build
+idf.py -B build-espnow -p COM_TX flash monitor
+```
+
+然后在 ESP-NOW 发射端 monitor 中配置 session 实验 ID：
 
 ```text
 research_tx --stop
@@ -66,18 +75,16 @@ idf.py -B build-research-rx -p COM_RX flash
 
 把 `COM_RX` 替换为接收端 UART 端口。运行 GUI 前关闭占用同一串口的 `idf.py monitor`。
 
-如果需要直接烧录已有构建产物，应使用构建目录中的 `flasher_args.json`，不要自行猜测偏移。接收端当前构建布局为：
+ESP-NOW 需要从仓库根目录编译并烧录匹配的接收端 profile：
 
 ```powershell
-cd build-research-rx
-python -m esptool --chip esp32s3 -p COM_RX -b 921600 write_flash `
-  0x0 bootloader/bootloader.bin `
-  0x8000 partition_table/partition-table.bin `
-  0x1d000 ota_data_initial.bin `
-  0x20000 console-csi-v6.bin
+idf.py -B build-rx-espnow -D IDF_TARGET=esp32s3 -D SDKCONFIG=sdkconfig.espnow -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.espnow.defaults" build
+idf.py -B build-rx-espnow -p COM_RX flash
 ```
 
-构建目录不会上传到 GitHub，因此推荐用户在本机重新编译并使用 `idf.py flash`。
+路由器和 ESP-NOW 对应不同固件镜像。ESP-NOW 采集前会核验接收模式与研究帧遥测。
+
+如需烧录已有构建产物，应使用对应构建目录中的 `flasher_args.json`。不同固件 profile 的分区布局可能不同。构建目录不会上传到 GitHub，推荐在本机编译并使用 `idf.py flash`。
 
 ## 启动界面
 
@@ -102,7 +109,7 @@ python esp_csi_tool.py -p COM_RX
 触发方式可以在运行时切换：
 
 - `router_ping`：适用于普通路由器和 ESP32-S3 SoftAP，兼容性最广；
-- `null_data`：由接收端发送 802.11 Null Data 帧，通常能提高 CSI 到达率，但会增加 Wi-Fi 控制流量。
+- `null_data`：由接收端发送 802.11 Null Data 帧，保留用于连接诊断；正式采集默认被拦截，需验证目标 AP 来源并显式启用 `allow_null_data_collection`。
 
 同一个 session 内应保持一种触发方式。切换后请新建 session，并重新采集空房和静止人员参考。串口等效命令为 `radar --send_mode router_ping` 和 `radar --send_mode null_data`。
 
@@ -123,12 +130,12 @@ python esp_csi_tool.py -p COM_RX `
 
 ## 采集流程
 
-1. 确认 TX/RX 信道和实验 ID 一致；
+1. 确认接收端连接目标 AP；使用 ESP-NOW 时核对 TX/RX 信道和实验 ID；
 2. 填写人员、地点、接收设备标签和 Tx-Rx 距离（m）；
 3. 选择动作；中英文切换只改变显示，不改变英文机器标签；
 4. 设置每次等待、采集时长和次数；串口设备变化后点击 Serial Refresh 重新扫描端口；
 5. 点击开始，每轮执行“等待倒计时 → 采集倒计时”，然后重复；
-6. 采集后检查 manifest 并在训练前校验。
+6. 动作采集前核对目标 MAC、目标帧率、模式稳定时间和人员站立静止基线；采集后检查每条质量状态并在训练前校验 manifest。
 
 输出示例：
 
@@ -148,13 +155,15 @@ CSV 内含 PC 时间、接收端单调时间、射频字段和解码后的 CSI �
 ```powershell
 cd tools
 python validate_session.py data\R01\2026-09-01
+python validate_all_sessions.py data
+python export_training_data.py data\R01\2026-09-01
 ```
 
-同一地点同一天的 manifest 可以索引多个 session。做严格 session 级检查或核心动作覆盖检查时，应先按 `session_id` 筛选。
+同一地点同一天的 manifest 可以索引多个 session。使用 `validate_session.py --session-id` 检查指定 session。训练导出仅保留完成且通过质量、目标来源检查的记录，不修改原始 CSV。补采标准见[采集质量说明](tools/COLLECTION_QUALITY.md)。
 
 清洗和模型基准请继续使用：
 
-- [esp-csi-fall-detection](https://github.com/lixb123/esp-csi-fall-detection)
+- [会议文章数据处理仓库](https://github.com/lixb123/Leakage-Aware-Selective-Learning-for-Resource-Constrained-Wi-Fi-CSI-Fall-Detection)
 
 ## 公开仓库范围
 

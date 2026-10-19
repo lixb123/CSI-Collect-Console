@@ -53,9 +53,12 @@ The sidecar stores experiment metadata, participant/room/session IDs, action sem
 - `rssi_mean`, `rssi_std`, `noise_floor_mean`, `agc_gain_mean`：射频摘要。
 - `send_mode`, `configured_send_interval_ms`, `observed_*`：发送配置与实际观察值。
 - `receiver_*`, `device_*`, `host_*`：接收包、队列、内存、主机管线时延等 ISAC/ISCC 指标。
+- `device_null_tx_count_delta`, `device_null_tx_error_count_delta`, `device_null_ack_or_response_count_delta`, `device_wifi_connected_end`：Null Data 触发和结束时连接状态；完整 `telemetry_start`/`telemetry_end` 保存在 `.meta.json`。
 - `started_at_utc`, `ended_at_utc`, `status`：标准化的实验采集时间与完成状态。
 
 `status=aborted` 表示中途停止或异常退出；不要直接混入训练集。`sequence_gap_count>0` 表示设备序号存在缺口，应检查丢包或串口/写盘压力。
+
+训练前运行 `python tools/export_training_data.py <session_root>`。该命令不会修改原始 CSV，只把通过 `quality_status`、目标 MAC、主 PHY 和 telemetry 门禁的帧写入 `training_filtered`。
 
 ## 3. 动作 CSV 字段怎么理解 / CSI row fields
 

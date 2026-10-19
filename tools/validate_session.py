@@ -10,7 +10,13 @@ from collections import Counter
 from pathlib import Path
 
 
-CORE_ACTIONS = {"wave", "move", "static", "none", "front", "after"}
+# Required labels for a new fall-detection session. Legacy labels remain
+# accepted by the ledger, but are not enough to certify a new protocol run.
+CORE_ACTIONS = {
+    "none", "static", "walk_slow", "walk_fast", "sit down", "stand up",
+    "bend", "pick_up", "lie_down", "turn",
+    "fall_forward", "fall_backward", "fall_left", "fall_right",
+}
 FALL_ACTIONS = {"wave", "fall_forward", "fall_backward", "fall_left", "fall_right"}
 
 
@@ -26,7 +32,8 @@ def as_bool(value: object) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def validate(session_root: Path, require_core_actions: bool = False) -> dict:
+def validate(session_root: Path, require_core_actions: bool = False,
+             session_id: str | None = None) -> dict:
     manifest = session_root / "session_manifest.csv"
     errors: list[str] = []
     warnings: list[str] = []
@@ -34,8 +41,12 @@ def validate(session_root: Path, require_core_actions: bool = False) -> dict:
         return {"status": "FAIL", "errors": [f"Missing {manifest}"], "warnings": [], "recordings": 0}
     with manifest.open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
+    if session_id is not None:
+        rows = [row for row in rows if row.get("session_id", "") == session_id]
+        if not rows:
+            errors.append(f"Manifest has no recordings for session_id={session_id!r}")
     session_ids = {row.get("session_id", "") for row in rows if row.get("session_id", "")}
-    if len(session_ids) > 1:
+    if session_id is None and len(session_ids) > 1:
         errors.append(
             "This room/day manifest contains multiple sessions; validate one session_id at a time "
             "or use the manifest as a day-level export index."
@@ -57,10 +68,18 @@ def validate(session_root: Path, require_core_actions: bool = False) -> dict:
             errors.append(f"One session manifest contains multiple {field} values: {sorted(values)}")
     actions = Counter(row.get("action", "") for row in rows)
     if require_core_actions:
-        missing = sorted(CORE_ACTIONS - set(actions))
+        covered_actions = {
+            row.get("action", "")
+            for row in rows
+            if (row.get("action", "") == "none"
+                or row.get("calibration_role", "").strip() == "activity")
+        }
+        missing = sorted(CORE_ACTIONS - covered_actions)
         if missing:
             errors.append(f"Session is missing required actions: {missing}")
     for row in rows:
+        schema_version = row.get("schema_version", "").strip()
+        current_schema = schema_version == "csi-experiment-manifest/1.1"
         try:
             csv_path = (session_root / row["relative_csv_path"]).resolve()
             sidecar_path = (session_root / row.get("sidecar_path", "")).resolve()
@@ -75,6 +94,7 @@ def validate(session_root: Path, require_core_actions: bool = False) -> dict:
         if not csv_path.exists():
             errors.append(f"Missing CSV: {csv_path}")
             continue
+        sidecar = None
         if not sidecar_path.exists():
             errors.append(f"Missing sidecar: {sidecar_path}")
         else:
@@ -102,9 +122,20 @@ def validate(session_root: Path, require_core_actions: bool = False) -> dict:
         try:
             telemetry_samples = int(row.get("device_telemetry_samples", "0") or "0")
             if telemetry_samples == 0:
-                warnings.append(f"No in-recording device telemetry; short-trial device metrics are unavailable: {csv_path}")
+                message = f"No in-recording device telemetry; short-trial device metrics are unavailable: {csv_path}"
+                if current_schema:
+                    errors.append(message)
+                else:
+                    warnings.append(message)
         except ValueError:
             errors.append(f"Invalid device telemetry sample count: {csv_path}")
+        if current_schema and isinstance(sidecar, dict):
+            telemetry_start = sidecar.get("telemetry_start")
+            telemetry_end = sidecar.get("telemetry_end")
+            if not isinstance(telemetry_start, dict) or not isinstance(telemetry_end, dict):
+                errors.append(f"Missing telemetry_start/telemetry_end in sidecar: {sidecar_path}")
+            elif not telemetry_start or not telemetry_end:
+                errors.append(f"Empty telemetry_start/telemetry_end in sidecar: {sidecar_path}")
         configured_interval = row.get("configured_send_interval_ms", "").strip()
         observed_interval = row.get("observed_send_interval_ms", "").strip()
         if configured_interval and observed_interval:
@@ -122,6 +153,33 @@ def validate(session_root: Path, require_core_actions: bool = False) -> dict:
             errors.append(
                 f"Configured/observed send mode mismatch ({configured_mode!r} != {observed_mode!r}): {csv_path}"
             )
+        target_mac = row.get("target_mac", "").strip().lower()
+        observed_mac = row.get("observed_primary_mac", "").strip().lower()
+        if target_mac:
+            if observed_mac and observed_mac != target_mac:
+                errors.append(
+                    f"Primary source MAC does not match target ({observed_mac} != {target_mac}): {csv_path}"
+                )
+            try:
+                target_fraction = float(row.get("target_mac_frame_fraction", "0") or "0")
+                if target_fraction < 0.95:
+                    errors.append(f"Target MAC frame fraction below 0.95 ({target_fraction:.4f}): {csv_path}")
+            except ValueError:
+                errors.append(f"Invalid target MAC frame fraction: {csv_path}")
+        elif current_schema:
+            errors.append(f"Manifest 1.1 recording has no target MAC: {csv_path}")
+        try:
+            phy_fraction = float(row.get("dominant_phy_fraction", "0") or "0")
+            if current_schema and phy_fraction < 0.95:
+                errors.append(f"Dominant PHY fraction below 0.95 ({phy_fraction:.4f}): {csv_path}")
+        except ValueError:
+            errors.append(f"Invalid dominant PHY fraction: {csv_path}")
+        quality_status = row.get("quality_status", "").strip()
+        if quality_status == "fail":
+            errors.append(f"Recording quality gate failed ({row.get('quality_reasons', '')}): {csv_path}")
+        if (as_bool(row.get("baseline_required")) and row.get("calibration_role", "").strip() == "activity"
+                and not as_bool(row.get("baseline_ready_at_start"))):
+            errors.append(f"Activity recording started without a qualified static baseline: {csv_path}")
         expected_tx_hash = row.get("transmitter_experiment_hash", "").strip()
         observed_tx_hash = row.get("observed_transmitter_experiment_hash", "").strip()
         if configured_mode == "espnow_research":
@@ -167,8 +225,19 @@ def validate(session_root: Path, require_core_actions: bool = False) -> dict:
         "actions": dict(sorted(actions.items())),
         "errors": errors,
         "warnings": warnings,
+        "group_keys": {
+            field: sorted({row.get(field, "") for row in rows if row.get(field, "")})
+            for field in ("participant_id", "session_id", "room_id", "site_id", "receiver_id", "device_pair_id")
+        },
     }
-    (session_root / "validation_report.json").write_text(
+    report_name = "validation_report.json"
+    if session_id is not None:
+        safe_session_id = "".join(
+            character if character.isalnum() or character in "-_." else "_"
+            for character in session_id
+        )
+        report_name = f"validation_report_{safe_session_id}.json"
+    (session_root / report_name).write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return result
@@ -178,8 +247,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("session_root", type=Path)
     parser.add_argument("--require-core-actions", action="store_true")
+    parser.add_argument("--session-id")
     args = parser.parse_args()
-    result = validate(args.session_root, args.require_core_actions)
+    result = validate(args.session_root, args.require_core_actions, args.session_id)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 1 if result["status"] == "FAIL" else 0
 

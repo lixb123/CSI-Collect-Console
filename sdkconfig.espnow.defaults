@@ -1,0 +1,4 @@
+# Dedicated ESP-NOW research receiver profile. The normal sdkconfig.defaults
+# remains unchanged, so Router Ping and legacy null_data stay the default.
+CONFIG_RESEARCH_RX_ESPNOW_MODE=y
+CONFIG_RESEARCH_RX_NULL_DATA_MODE=n

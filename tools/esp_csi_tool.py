@@ -36,6 +36,7 @@ import threading
 import base64
 import time
 from queue import Empty
+from acquisition_quality import (ConnectionIdentity, acquisition_defaults, preflight_error, offer_preview)
 from datetime import datetime
 from multiprocessing import Process, Queue
 
@@ -49,12 +50,47 @@ import signal as signal_key
 import socket
 from pathlib import Path
 
-from experiment_capture import ExperimentLedger, load_experiment_config, sha256_file, validate_action_label
+from experiment_capture import (
+    ExperimentLedger, load_experiment_config, normalize_mac, session_baseline_status,
+    session_reference_status,
+    sha256_file, validate_action_label,
+)
 
 
 CSI_SAMPLE_RATE = 100
 CSI_DISPLAY_INTERVAL_MS = 100
 CSI_DISPLAY_MAX_POINTS = 250
+
+
+def resolve_data_root(value='data', working_directory=None):
+    """Resolve portable roots from the current working directory.
+
+    Relative values move with the project. A stale absolute path copied from
+    another computer falls back to the current working directory's data folder.
+    """
+    base = Path(working_directory or Path.cwd()).resolve()
+    raw_value = str(value or 'data').strip() or 'data'
+    candidate = Path(raw_value).expanduser()
+    if not candidate.is_absolute():
+        return str((base / candidate).resolve())
+    try:
+        if candidate.exists():
+            return str(candidate.resolve())
+    except OSError:
+        pass
+    return str((base / 'data').resolve())
+
+
+def session_identity_metadata(session_id, receiver_id, router_id, sender_id=''):
+    """Derive session-bound identifiers from the operator-entered labels."""
+    peer_id = str(sender_id or router_id).strip()
+    receiver_id = str(receiver_id).strip()
+    return {
+        'transmitter_experiment_id': session_id,
+        'device_pair_id': f'{receiver_id}__{peer_id}' if receiver_id and peer_id else '',
+        'calibration_id': f'{session_id}-CAL01',
+        'trial_id_prefix': f'{session_id}-',
+    }
 
 
 class SerialConnectionController:
@@ -71,6 +107,16 @@ class SerialConnectionController:
 
     def is_connected(self):
         return self.process is not None and self.process.is_alive()
+
+    def set_experiment_context(self, experiment_config, data_root):
+        self.experiment_config = experiment_config
+        self.data_root = str(data_root)
+        if self.is_connected():
+            self.queue_write.put({
+                'type': 'activate_experiment',
+                'experiment_config': experiment_config,
+                'data_root': str(data_root),
+            })
 
     def start(self, port):
         port = str(port or '').strip()
@@ -135,13 +181,16 @@ csi_vaid_subcarrier_color += [(0, i * color_step, 0)
                               for i in range(1,  26 // CSI_VAID_SUBCARRIER_INTERVAL + 2)]
 
 DEVICE_INFO_COLUMNS_NAMES = ['type', 'timestamp', 'compile_time', 'chip_name', 'chip_revision',
-                             'app_revision', 'idf_revision', 'total_heap', 'free_heap', 'router_ssid', 'ip', 'port']
+                             'app_revision', 'idf_revision', 'total_heap', 'free_heap', 'router_ssid', 'ip', 'port',
+                             'receiver_mac', 'capture_protocol']
 SYSTEM_TELEMETRY_COLUMNS_NAMES = ['type', 'device_uptime_ms', 'csi_received', 'queue_drops',
                                   'queue_depth', 'queue_high_water', 'free_heap', 'minimum_free_heap',
                                   'send_interval_ms', 'send_mode', 'research_rx_valid',
                                   'research_rx_crc_errors', 'research_rx_other_errors',
                                   'research_rx_seq_gaps', 'research_rx_bytes', 'research_rx_last_seq',
-                                  'research_rx_experiment_hash']
+                                  'research_rx_experiment_hash', 'null_tx_count',
+                                  'null_tx_error_count', 'null_ack_or_response_count',
+                                  'wifi_connected']
 g_device_info_series = None
 
 CSI_DATA_INDEX = 500  # buffer size
@@ -149,39 +198,57 @@ CSI_DATA_COLUMNS = len(csi_vaid_subcarrier_index)
 CSI_DATA_COLUMNS_NAMES = ['type', 'seq', 'timestamp', 'taget_seq', 'taget', 'mac', 'rssi', 'rate', 'sig_mode', 'mcs',
                           'cwb', 'smoothing', 'not_sounding', 'aggregation', 'stbc', 'fec_coding','sgi', 'noise_floor',
                           'ampdu_cnt', 'channel_primary', 'channel_secondary', 'local_timestamp', 'ant', 'sig_len',
-                          'rx_state', 'agc_gain', 'fft_gain', 'len', 'first_word_invalid', 'data']
+                          'rx_state', 'agc_gain', 'fft_gain', 'rx_seq', 'len', 'first_word_invalid', 'data']
 ACTION_LABELS = [
     ('unknown', '未选择', 'Not selected'),
-    ('train', '环境基线（兼容）', 'Environment baseline (legacy)'),
     ('none', '无人环境', 'Empty room'),
-    ('someone', '有人存在（辅助）', 'Occupied (auxiliary)'),
     ('static', '站立静止', 'Standing still'),
-    ('move', '一般移动（辅助）', 'General movement (auxiliary)'),
-    ('front', '向前行走（兼容 front）', 'Walk forward (legacy front)'),
-    ('after', '向后行走（兼容 after）', 'Walk backward (legacy after)'),
-    ('left', '向左移动', 'Move left'),
-    ('right', '向右移动', 'Move right'),
-    ('go', '正常行走（兼容 go）', 'Normal walking (legacy go)'),
-    ('jump', '跳跃', 'Jumping'),
+    ('walk_slow', '慢走', 'Slow walking'),
+    ('walk_fast', '快走', 'Fast walking'),
     ('sit down', '坐下', 'Sitting down'),
     ('stand up', '站起', 'Standing up'),
-    ('climb up', '上楼／攀爬', 'Climbing up'),
-    ('wave', '模拟跌倒（兼容 wave）', 'Demonstrated fall (legacy wave)'),
-    ('applause', '鼓掌（辅助）', 'Clapping (auxiliary)'),
-    ('fall_forward', '向前跌倒', 'Forward fall'),
-    ('fall_backward', '向后跌倒', 'Backward fall'),
-    ('fall_left', '向左侧跌倒', 'Left-side fall'),
-    ('fall_right', '向右侧跌倒', 'Right-side fall'),
     ('bend', '弯腰', 'Bending'),
     ('pick_up', '拾取物品', 'Picking up an object'),
     ('lie_down', '主动躺下', 'Lying down intentionally'),
     ('turn', '转身', 'Turning'),
-    ('walk_slow', '慢走', 'Slow walking'),
-    ('walk_fast', '快走', 'Fast walking'),
+    ('fall_forward', '向前跌倒', 'Forward fall'),
+    ('fall_backward', '向后跌倒', 'Backward fall'),
+    ('fall_left', '向左侧跌倒', 'Left-side fall'),
+    ('fall_right', '向右侧跌倒', 'Right-side fall'),
 ]
-CSI_DATA_TARGETS = [item[0] for item in ACTION_LABELS]
-CSI_DATA_TARGET_LABELS_ZH = [item[1] for item in ACTION_LABELS]
-CSI_DATA_TARGET_LABELS_EN = [item[2] for item in ACTION_LABELS]
+COLLECTION_ITEMS = [
+    ('unknown', 'unknown', 'activity', '未选择', 'Not selected'),
+    ('empty_room_reference', 'none', 'empty_room_reference',
+     '空房参考（无人环境）', 'Empty-room reference'),
+    ('activity_static', 'static', 'activity', '站立静止动作', 'Standing-still activity'),
+    ('activity_walk_slow', 'walk_slow', 'activity', '慢走', 'Slow walking'),
+    ('activity_walk_fast', 'walk_fast', 'activity', '快走', 'Fast walking'),
+    ('activity_sit_down', 'sit down', 'activity', '坐下', 'Sitting down'),
+    ('activity_stand_up', 'stand up', 'activity', '站起', 'Standing up'),
+    ('activity_bend', 'bend', 'activity', '弯腰', 'Bending'),
+    ('activity_pick_up', 'pick_up', 'activity', '拾取物品', 'Picking up an object'),
+    ('activity_lie_down', 'lie_down', 'activity', '主动躺下', 'Lying down intentionally'),
+    ('activity_turn', 'turn', 'activity', '转身', 'Turning'),
+    ('activity_fall_forward', 'fall_forward', 'activity', '向前跌倒', 'Forward fall'),
+    ('activity_fall_backward', 'fall_backward', 'activity', '向后跌倒', 'Backward fall'),
+    ('activity_fall_left', 'fall_left', 'activity', '向左侧跌倒', 'Left-side fall'),
+    ('activity_fall_right', 'fall_right', 'activity', '向右侧跌倒', 'Right-side fall'),
+]
+
+
+def collection_item_key(action, calibration_role):
+    """Return the unified UI item for a stored action/role pair."""
+    action = str(action or 'unknown')
+    calibration_role = str(calibration_role or 'activity')
+    for key, item_action, item_role, _, _ in COLLECTION_ITEMS:
+        if item_action == action and item_role == calibration_role:
+            return key
+    for key, item_action, _, _, _ in COLLECTION_ITEMS:
+        if item_action == action:
+            return key
+    return 'unknown'
+
+
 STATISTICS_MODES = [('minute', '分钟'), ('hour', '小时'), ('day', '天')]
 COMMAND_OPTIONS = [
     ('', '无'),
@@ -217,7 +284,7 @@ RADAR_DATA_COLUMNS_NAMES = ['type', 'seq', 'timestamp',
                             'waveform_jitter', 'jitter_midean', 'waveform_jitter_threshold', 'move_status']
 
 g_csi_amplitude_array = np.zeros(
-    [CSI_DATA_INDEX, CSI_DATA_COLUMNS], dtype=np.int32)
+    [CSI_DATA_INDEX, CSI_DATA_COLUMNS], dtype=np.float32)
 g_rssi_array = np.zeros(CSI_DATA_INDEX, dtype=np.int8)
 g_csi_update_counter = 0
 # 使用 object 类型以支持混合数据类型（字符串、数字、时间戳等）
@@ -370,17 +437,44 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                  data_root='data', initial_port=None, parent=None):
         super(DataGraphicalWindow, self).__init__(parent)
         self.setupUi(self)
+        self.link_state = {}
+        self.link_received_at = 0.0
+        self.textBrowser_log.document().setMaximumBlockCount(500)
+        if experiment_config:
+            experiment_config = acquisition_defaults(experiment_config)
+        self.pushButton_static_baseline = QPushButton(self.groupBox_18)
+        self.pushButton_static_baseline.clicked.connect(self.start_static_baseline)
+        self.pushButton_empty_room = QPushButton(self.groupBox_18)
+        self.pushButton_empty_room.clicked.connect(self.start_empty_room_reference)
+        self.pushButton_new_experiment = QPushButton(self.groupBox_18)
+        self.pushButton_load_experiment = QPushButton(self.groupBox_18)
+        self.pushButton_save_experiment = QPushButton(self.groupBox_18)
+        self.pushButton_choose_data_root = QPushButton(self.groupBox_18)
+        self.lineEdit_data_root = QLineEdit(self.groupBox_18)
+        self.lineEdit_data_root.setReadOnly(True)
+        for button, handler in (
+            (self.pushButton_new_experiment, self.new_experiment_config),
+            (self.pushButton_load_experiment, self.load_experiment_config_dialog),
+            (self.pushButton_save_experiment, self.save_experiment_config_dialog),
+            (self.pushButton_choose_data_root, self.choose_data_root),
+        ):
+            button.clicked.connect(handler)
+        self.csi_output_type = csi_output_type
+        self.experiment_config = experiment_config
+        self.data_root = data_root
+        self._setup_wifi_selector()
         self._arrange_collection_metadata()
         self._arrange_collection_controls()
         self._arrange_radar_controls()
         self._detach_collection_panel()
         self._arrange_display_panels()
         self._configure_connection_inputs()
-        self.gui_config_path = Path('./config/gui_config.json')
+        config_dir = Path(__file__).resolve().parent / 'config'
+        self.gui_config_path = config_dir / 'gui_config.json'
         try:
             self.gui_config = json.loads(self.gui_config_path.read_text(encoding='utf-8'))
         except Exception:
-            example_path = Path('./config/gui_config.example.json')
+            example_path = config_dir / 'gui_config.example.json'
             try:
                 self.gui_config = json.loads(example_path.read_text(encoding='utf-8'))
             except Exception:
@@ -390,6 +484,15 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                 json.dumps(self.gui_config, ensure_ascii=False, indent=2), encoding='utf-8'
             )
         self.language = self.gui_config.get('language', 'en')
+        if experiment_config is not None:
+            # An explicit CLI root is authoritative even if the folder is new.
+            self.data_root = str(data_root)
+        else:
+            configured_data_root = self.gui_config.get('data_root', data_root)
+            self.data_root = resolve_data_root(configured_data_root)
+        config_source = (experiment_config or {}).get('config_source')
+        self.experiment_config_path = Path(config_source) if config_source else None
+        self.lineEdit_data_root.setText(str(Path(self.data_root).resolve()))
         self.serial_controller = serial_controller
         self.serial_queue_write = serial_controller.queue_write
         self._initial_serial_port = initial_port or self.gui_config.get('serial_port', '')
@@ -400,18 +503,26 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             self.comboBox_statistics_mode.setItemText(index, label)
             self.comboBox_statistics_mode.setItemData(index, mode)
         self.comboBox_collect_target.clear()
-        for action, label in zip(CSI_DATA_TARGETS, CSI_DATA_TARGET_LABELS_ZH):
-            self.comboBox_collect_target.addItem(label, action)
-        self.csi_output_type = csi_output_type
-        self.experiment_config = experiment_config
-        self.data_root = data_root
+        for key, action, role, label_zh, _ in COLLECTION_ITEMS:
+            self.comboBox_collect_target.addItem(label_zh, key)
+            index = self.comboBox_collect_target.count() - 1
+            self.comboBox_collect_target.setItemData(index, action, Qt.UserRole + 1)
+            self.comboBox_collect_target.setItemData(index, role, Qt.UserRole + 2)
         participant_id = ''
+        session_id = ''
         room_id = ''
         receiver_id = ''
+        target_mac = ''
+        router_id = ''
+        sender_id = ''
         if self.experiment_config:
             participant_id = str(self.experiment_config.get('participant_id', ''))
+            session_id = str(self.experiment_config.get('session_id', ''))
             room_id = str(self.experiment_config.get('room_id', ''))
             receiver_id = str(self.experiment_config.get('receiver_id', ''))
+            target_mac = str(self.experiment_config.get('target_mac', ''))
+            router_id = str(self.experiment_config.get('router_id', ''))
+            sender_id = str(self.experiment_config.get('sender_id', ''))
             self.setWindowTitle(
                 f"ESP CSI 研究采集 - {self.experiment_config['session_id']} - "
                 f"{participant_id} - {room_id} - {receiver_id}"
@@ -421,8 +532,12 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                 "研究采集模式下禁用清空功能，以保护会话清单和已完成记录。"
             )
         self.lineEdit_participant_id.setText(participant_id)
+        self.lineEdit_session_id.setText(session_id)
         self.lineEdit_room_id.setText(room_id)
         self.lineEdit_receiver_id.setText(receiver_id)
+        self.lineEdit_target_mac.setText(target_mac)
+        self.lineEdit_router_id.setText(router_id)
+        self.lineEdit_sender_id.setText(sender_id)
         configured_distance = (self.experiment_config or {}).get(
             'distance_m', self.gui_config.get('distance_m', 0.0))
         try:
@@ -432,6 +547,10 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.lineEdit_participant_id.setAccessibleName('人员标签 participant_id')
         self.lineEdit_room_id.setAccessibleName('地点标签 room_id')
         self.lineEdit_receiver_id.setAccessibleName('设备标签 receiver_id')
+        self.lineEdit_session_id.setAccessibleName('会话标签 session_id')
+        self.lineEdit_target_mac.setAccessibleName('目标发送 MAC target_mac')
+        self.lineEdit_router_id.setAccessibleName('路由器标签 router_id')
+        self.lineEdit_sender_id.setAccessibleName('发送端标签 sender_id')
         self.comboBox_send_mode.setAccessibleName('CSI trigger mode')
         id_validator = QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
         self.lineEdit_participant_id.setValidator(id_validator)
@@ -439,6 +558,18 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
         )
         self.lineEdit_receiver_id.setValidator(
+            QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
+        )
+        self.lineEdit_router_id.setValidator(
+            QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
+        )
+        self.lineEdit_sender_id.setValidator(
+            QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
+        )
+        self.lineEdit_target_mac.setValidator(
+            QRegExpValidator(QRegExp(r'(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}'), self)
+        )
+        self.lineEdit_session_id.setValidator(
             QRegExpValidator(QRegExp(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}'), self)
         )
         self.lineEdit_participant_id.setStyleSheet(
@@ -459,15 +590,6 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.checkBox_complex_csi.setChecked(bool(
             (self.experiment_config or {}).get('complex_csi_enabled',
                 self.gui_config.get('complex_csi_enabled', True))))
-        self.comboBox_calibration_role = QComboBox(self.groupBox_18)
-        self.comboBox_calibration_role.addItem('Activity', 'activity')
-        self.comboBox_calibration_role.addItem('Empty-room reference', 'empty_room_reference')
-        self.comboBox_calibration_role.addItem('Static-person reference', 'static_reference')
-        saved_role = (self.experiment_config or {}).get(
-            'calibration_role', self.gui_config.get('calibration_role', 'activity'))
-        role_index = self.comboBox_calibration_role.findData(saved_role)
-        if role_index >= 0:
-            self.comboBox_calibration_role.setCurrentIndex(role_index)
         # Keep identity/location on their own row.  The physics controls have
         # longer bilingual labels and were too compressed at 1366x768 when
         # appended to the metadata row.
@@ -475,10 +597,17 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.horizontalLayout_physics_csi.setSpacing(10)
         self.horizontalLayout_physics_csi.addWidget(self.label_complex_csi)
         self.horizontalLayout_physics_csi.addWidget(self.checkBox_complex_csi)
-        self.horizontalLayout_physics_csi.addWidget(self.comboBox_calibration_role, 1)
-        self.horizontalLayout_physics_csi.addStretch(2)
+        self.label_baseline_status = QLabel(self.groupBox_18)
+        self.label_baseline_status.setWordWrap(True)
+        self.label_empty_room_status = QLabel(self.groupBox_18)
+        self.label_empty_room_status.setWordWrap(True)
+        self.horizontalLayout_physics_csi.addStretch(1)
         self.verticalLayout_3.insertLayout(1, self.horizontalLayout_physics_csi)
-        self.groupBox_18.setMinimumHeight(270)
+        self.verticalLayout_3.insertWidget(2, self.label_baseline_status)
+        self.verticalLayout_3.insertWidget(3, self.label_empty_room_status)
+        self.groupBox_18.setMinimumHeight(350)
+        self._arrange_experiment_controls()
+        self.refresh_baseline_status()
         self.collect_overlay = QFrame(self.centralwidget)
         self.collect_overlay.setObjectName('collect_overlay')
         self.collect_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -499,13 +628,18 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             # print(f"gui_config: {gui_config}")
             if len(gui_config.get('router_ssid', '')) > 0:
                 self.lineEdit_router_ssid.setText(gui_config['router_ssid'])
-            if len(gui_config.get('router_password', '')) >= 8:
+            self.checkBox_remember_password.setChecked(bool(gui_config.get('remember_password', False)))
+            if self.checkBox_remember_password.isChecked() and len(gui_config.get('router_password', '')) >= 8:
                 self.lineEdit_router_password.setText(
                     gui_config['router_password'])
             if not self.experiment_config:
                 self.lineEdit_participant_id.setText(gui_config.get('participant_id', ''))
+                self.lineEdit_session_id.setText(gui_config.get('session_id', ''))
                 self.lineEdit_room_id.setText(gui_config.get('room_id', ''))
                 self.lineEdit_receiver_id.setText(gui_config.get('receiver_id', ''))
+                self.lineEdit_target_mac.setText(gui_config.get('target_mac', ''))
+                self.lineEdit_router_id.setText(gui_config.get('router_id', ''))
+                self.lineEdit_sender_id.setText(gui_config.get('sender_id', ''))
 
             g_display_raw_data = gui_config.get('display_raw_data', True)
             if g_display_raw_data:
@@ -536,10 +670,28 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             if mode_index >= 0:
                 self.comboBox_send_mode.setCurrentIndex(mode_index)
 
+        # An explicitly loaded session must override the previous GUI mode.
+        if self.experiment_config:
+            mode_index = self.comboBox_send_mode.findText(
+                str(self.experiment_config.get('send_mode', 'router_ping')))
+            if mode_index >= 0:
+                self.comboBox_send_mode.setCurrentIndex(mode_index)
+
         saved_action = gui_config.get('collect_action', 'none')
-        saved_action_index = self.comboBox_collect_target.findData(saved_action)
-        if saved_action_index >= 0:
-            self.comboBox_collect_target.setCurrentIndex(saved_action_index)
+        saved_role = (self.experiment_config or {}).get(
+            'calibration_role', gui_config.get('calibration_role', 'activity'))
+        saved_item = gui_config.get(
+            'collection_item', collection_item_key(saved_action, saved_role))
+        saved_item_index = self.comboBox_collect_target.findData(saved_item)
+        if saved_item_index < 0:
+            saved_item_index = self.comboBox_collect_target.findData(
+                collection_item_key(saved_action, saved_role))
+        if saved_item_index >= 0:
+            self.comboBox_collect_target.setCurrentIndex(saved_item_index)
+        empty_room_index = self.comboBox_collect_target.findData('empty_room_reference')
+        if empty_room_index >= 0:
+            self.comboBox_collect_target.setItemText(
+                empty_room_index, self.tr_text('空房参考（无人环境）', 'Empty-room reference (no person)'))
         self.timeEdit_collect_delay.setValue(max(0, int(gui_config.get('collect_wait_seconds', 3))))
         self.spinBox_collect_duration.setValue(max(1, int(gui_config.get('collect_duration_seconds', 3))))
         self.spinBox_collect_number.setValue(max(1, int(gui_config.get('collect_number', 1))))
@@ -570,6 +722,7 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         # self.graphicsView_rssi.setYRange(-10, -65)
         self.checkBox_router_auto_connect.released.connect(
             self.show_router_auto_connect)
+        self.checkBox_remember_password.toggled.connect(self.save_wifi_preferences)
 
         self.curve_radar_eigenvalue = []
         self.curve_radar_eigenvalue_threshold = []
@@ -737,10 +890,19 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.collect_total_trials = 0
         self.collect_current_trial = 0
         self.collect_action_label = ''
+        self.collection_action_override = None
+        self.collection_role_override = None
+        self.collection_label_override = None
         self.collect_delay_remaining = 0
         self.collect_duration_remaining = 0
+        self._baseline_saved_duration = None
         self.checkBox_complex_csi.stateChanged.connect(self.update_physics_capture_config)
-        self.comboBox_calibration_role.currentIndexChanged.connect(self.update_physics_capture_config)
+        self.comboBox_collect_target.currentIndexChanged.connect(self.collection_item_changed)
+        self.spinBox_collect_number.setToolTip('同一动作建议至少重复 3 次，保持路线与设备位置不变。')
+        self.timeEdit_collect_delay.setToolTip('每次动作前留出准备时间；改变模式后至少等待 3 秒。')
+        self.pushButton_static_baseline.setToolTip('保持同一站位静止 60 秒；更换来源、模式或设备摆位后重新采集。')
+        self.pushButton_empty_room.setToolTip('确保房间内无人并保持环境不变，采集 60 秒空房参考。')
+        self.checkBox_wave_filtering.setToolTip('仅平滑预览；原始 I/Q 存盘不受影响。')
         self.update_physics_capture_config()
 
         self.train_duration = self.timeEdit_train_duration.time()
@@ -766,15 +928,91 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.checkBox_radar_model_show()
         self.checkBox_display_eigenvalues_table_show()
         self.apply_language()
-        self.update_serial_connection_ui()
+
+    def _setup_wifi_selector(self):
+        """Add a scan-and-select control without changing the generated UI file."""
+        # Move the generated Wi-Fi controls down one row so the selector is
+        # visibly above the SSID/password inputs.
+        for widget in (
+            self.label_delay_2, self.lineEdit_router_ssid,
+            self.label_duration_2, self.lineEdit_router_password,
+            self.label_send_mode, self.comboBox_send_mode,
+            self.checkBox_router_auto_connect, self.pushButton_router_connect,
+        ):
+            self.horizontalLayout_13.removeWidget(widget)
+        self.horizontalLayout_13.addWidget(self.label_delay_2, 1, 0, 1, 1)
+        self.horizontalLayout_13.addWidget(self.lineEdit_router_ssid, 1, 1, 1, 1)
+        self.horizontalLayout_13.addWidget(self.label_duration_2, 1, 2, 1, 1)
+        self.horizontalLayout_13.addWidget(self.lineEdit_router_password, 1, 3, 1, 1)
+        self.horizontalLayout_13.addWidget(self.label_send_mode, 2, 0, 1, 1)
+        self.horizontalLayout_13.addWidget(self.comboBox_send_mode, 2, 1, 1, 1)
+        self.horizontalLayout_13.addWidget(self.checkBox_router_auto_connect, 2, 2, 1, 1)
+        self.horizontalLayout_13.addWidget(self.pushButton_router_connect, 2, 3, 1, 1)
+
+        self.comboBox_wifi_network = QComboBox(self.groupBox_11)
+        self.comboBox_wifi_network.setEditable(False)
+        self.comboBox_wifi_network.setMinimumWidth(180)
+        self.comboBox_wifi_network.setAccessibleName('Wi-Fi network selector')
+        self.comboBox_wifi_network.addItem('Scan and select Wi-Fi')
+        self.pushButton_wifi_scan = QPushButton(self.groupBox_11)
+        self.pushButton_wifi_scan.setObjectName('pushButton_wifi_scan')
+        self.pushButton_wifi_scan.setText('扫描 Wi-Fi')
+        self.label_wifi_status = QLabel(self.groupBox_11)
+        self.label_wifi_status.setText('未验证')
+        self.label_wifi_status.setStyleSheet('color: #666;')
+        self.label_wifi_network = QLabel(self.groupBox_11)
+        self.label_wifi_network.setText('Wi-Fi')
+        self.horizontalLayout_13.addWidget(self.label_wifi_network, 0, 0, 1, 1)
+        self.horizontalLayout_13.addWidget(self.comboBox_wifi_network, 0, 1, 1, 1)
+        self.horizontalLayout_13.addWidget(self.pushButton_wifi_scan, 0, 2, 1, 1)
+        self.horizontalLayout_13.addWidget(self.label_wifi_status, 0, 3, 1, 1)
+        self.comboBox_wifi_network.currentIndexChanged.connect(self._select_wifi_network)
+        self.pushButton_wifi_scan.released.connect(self.command_wifi_scan)
+        self.checkBox_remember_password = QCheckBox(self.groupBox_11)
+        self.checkBox_remember_password.setObjectName('checkBox_remember_password')
+        self.checkBox_remember_password.setChecked(False)
+        self.horizontalLayout_13.addWidget(self.checkBox_remember_password, 3, 1, 1, 2)
+
+    def command_wifi_scan(self):
+        if not self.serial_controller.is_connected():
+            self.label_wifi_status.setText(self.tr_text('请先连接串口', 'Connect the serial port first'))
+            self.label_wifi_status.setStyleSheet('color: #b00020;')
+            return
+        self.comboBox_wifi_network.clear()
+        self.comboBox_wifi_network.addItem(self.tr_text('正在扫描…', 'Scanning…'))
+        self.label_wifi_status.setText(self.tr_text('扫描中…', 'Scanning…'))
+        self.label_wifi_status.setStyleSheet('color: #666;')
+        self.serial_queue_write.put('wifi_scan')
+
+    def _select_wifi_network(self, _index):
+        ssid = self.comboBox_wifi_network.currentData()
+        if ssid:
+            self.lineEdit_router_ssid.setText(str(ssid))
+
+    @staticmethod
+    def _console_quote(value):
+        """Quote one esp-console argument while preserving spaces/symbols."""
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
     def tr_text(self, zh, en):
         return en if self.language == 'en' else zh
 
     def _arrange_collection_metadata(self):
-        """Put the three identity fields on separate rows for readable labels."""
+        """Lay out identity and radio-domain fields used for grouped evaluation."""
         metadata_layout = self.horizontalLayout_collect_metadata
         self.verticalLayout_3.removeItem(metadata_layout)
+        self.label_session_id = QLabel(self.groupBox_18)
+        self.lineEdit_session_id = QLineEdit(self.groupBox_18)
+        self.lineEdit_session_id.setMaxLength(64)
+        self.label_target_mac = QLabel(self.groupBox_18)
+        self.label_router_id = QLabel(self.groupBox_18)
+        self.label_sender_id = QLabel(self.groupBox_18)
+        self.lineEdit_target_mac = QLineEdit(self.groupBox_18)
+        self.lineEdit_router_id = QLineEdit(self.groupBox_18)
+        self.lineEdit_sender_id = QLineEdit(self.groupBox_18)
+        self.pushButton_use_current_mac = QPushButton(self.groupBox_18)
+        self.pushButton_use_current_mac.setMaximumWidth(100)
+        self.pushButton_use_current_mac.clicked.connect(self.use_current_target_mac)
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(6)
@@ -782,12 +1020,23 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             (self.label_participant_id, self.lineEdit_participant_id),
             (self.label_room_id, self.lineEdit_room_id),
             (self.label_receiver_id, self.lineEdit_receiver_id),
+            (self.label_router_id, self.lineEdit_router_id),
+            (self.label_sender_id, self.lineEdit_sender_id),
+            (self.label_session_id, self.lineEdit_session_id),
         )
-        for row, (label, editor) in enumerate(fields):
-            grid.addWidget(label, row, 0)
-            grid.addWidget(editor, row, 1)
-        grid.setColumnStretch(0, 0)
+        for index, (label, editor) in enumerate(fields):
+            block_row = (index // 3) * 2
+            column = index % 3
+            grid.addWidget(label, block_row, column)
+            grid.addWidget(editor, block_row + 1, column)
+        grid.addWidget(self.label_target_mac, 4, 0, 1, 3)
+        target_mac_layout = QHBoxLayout()
+        target_mac_layout.addWidget(self.lineEdit_target_mac, 1)
+        target_mac_layout.addWidget(self.pushButton_use_current_mac)
+        grid.addLayout(target_mac_layout, 5, 0, 1, 3)
+        grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
         self.verticalLayout_3.insertLayout(0, grid)
         self.collection_metadata_layout = grid
 
@@ -865,22 +1114,43 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(6)
-        grid.addWidget(self.label_target_4, 0, 0)
-        grid.addWidget(self.comboBox_collect_target, 0, 1, 1, 3)
-        grid.addWidget(self.label_delay, 1, 0)
-        grid.addWidget(self.timeEdit_collect_delay, 1, 1)
-        grid.addWidget(self.label_duration, 1, 2)
-        grid.addWidget(self.spinBox_collect_duration, 1, 3)
-        grid.addWidget(self.label_number, 2, 0)
-        grid.addWidget(self.spinBox_collect_number, 2, 1)
-        grid.addWidget(self.pushButton_collect_clean, 2, 2)
-        grid.addWidget(self.pushButton_collect_start, 2, 3)
+        grid.addWidget(self.pushButton_empty_room, 0, 0, 1, 2)
+        grid.addWidget(self.pushButton_static_baseline, 0, 2, 1, 2)
+        grid.addWidget(self.label_target_4, 1, 0)
+        grid.addWidget(self.comboBox_collect_target, 1, 1, 1, 3)
+        grid.addWidget(self.label_delay, 2, 0)
+        grid.addWidget(self.timeEdit_collect_delay, 2, 1)
+        grid.addWidget(self.label_duration, 2, 2)
+        grid.addWidget(self.spinBox_collect_duration, 2, 3)
+        grid.addWidget(self.label_number, 3, 0)
+        grid.addWidget(self.spinBox_collect_number, 3, 1)
+        grid.addWidget(self.pushButton_collect_clean, 3, 2)
+        grid.addWidget(self.pushButton_collect_start, 3, 3)
         grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 0)
         grid.setColumnStretch(3, 1)
         self.verticalLayout_3.insertLayout(1, grid)
         self.collection_controls_layout = grid
+
+    def _arrange_experiment_controls(self):
+        """Add the operator-facing session/config and output controls."""
+        layout = QGridLayout()
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
+        self.label_session_controls = QLabel(self.groupBox_18)
+        self.label_data_root = QLabel(self.groupBox_18)
+        layout.addWidget(self.label_session_controls, 0, 0)
+        layout.addWidget(self.pushButton_new_experiment, 0, 1)
+        layout.addWidget(self.pushButton_load_experiment, 0, 2)
+        layout.addWidget(self.pushButton_save_experiment, 0, 3)
+        layout.addWidget(self.label_data_root, 1, 0)
+        layout.addWidget(self.lineEdit_data_root, 1, 1, 1, 2)
+        layout.addWidget(self.pushButton_choose_data_root, 1, 3)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(2, 1)
+        self.verticalLayout_3.insertLayout(1, layout)
+        self.experiment_controls_layout = layout
 
     def _apply_default_display_sizes(self):
         total_width = max(self.splitter_display.width(), 900)
@@ -946,6 +1216,126 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
     def save_tx_rx_distance(self, value):
         self.save_gui_config(distance_m=round(float(value), 2))
 
+    def _session_collection_root(self):
+        config = self.experiment_config or {}
+        room_id = self.lineEdit_room_id.text().strip() or str(config.get('room_id', 'ROOM'))
+        date_text = str(config.get('date') or datetime.now().strftime('%Y-%m-%d'))
+        return Path(self.data_root) / room_id / date_text
+
+    def refresh_baseline_status(self):
+        if not hasattr(self, 'label_baseline_status') or not hasattr(self, 'label_empty_room_status'):
+            return
+        if not self.experiment_config:
+            self.label_baseline_status.setText(self.tr_text(
+                '尚未建立实验 session：请点击“新建实验”或“加载配置”。',
+                'No experiment session is active: select New session or Load.'))
+            self.label_baseline_status.setStyleSheet('color: #996515;')
+            self.label_empty_room_status.setText(self.tr_text(
+                '空房参考：未采集（请先建立实验 session）',
+                'Empty-room reference: not recorded (create a session first).'))
+            self.label_empty_room_status.setStyleSheet('color: #996515;')
+            return
+        status = session_baseline_status(self._session_collection_root(), self.experiment_config)
+        if status['ready']:
+            self.label_baseline_status.setText(self.tr_text(
+                f"人员站立静止基线通过：{status['recording_id']}",
+                f"Standing-person baseline ready: {status['recording_id']}"))
+            self.label_baseline_status.setStyleSheet('color: green; font-weight: 600;')
+        else:
+            self.label_baseline_status.setText(self.tr_text(
+                f"正式动作前需完成人员站立静止基线 {status['minimum_s']:.0f} 秒（{status['reason']}）",
+                f"A {status['minimum_s']:.0f} s standing-person baseline is required before activities ({status['reason']})."))
+            self.label_baseline_status.setStyleSheet('color: #b00020; font-weight: 600;')
+        empty_status = session_reference_status(
+            self._session_collection_root(), self.experiment_config, 'empty_room_reference',
+            float(self.experiment_config.get('empty_room_min_duration_s', 60) or 60))
+        if empty_status['ready']:
+            self.label_empty_room_status.setText(self.tr_text(
+                f"空房参考通过：{empty_status['recording_id']}",
+                f"Empty-room reference ready: {empty_status['recording_id']}"))
+            self.label_empty_room_status.setStyleSheet('color: green; font-weight: 600;')
+        else:
+            self.label_empty_room_status.setText(self.tr_text(
+                f"空房参考：未通过（{empty_status['reason']}）",
+                f"Empty-room reference: not ready ({empty_status['reason']})"))
+            self.label_empty_room_status.setStyleSheet('color: #b00020; font-weight: 600;')
+
+    def use_current_target_mac(self):
+        value = self.link_state.get('bssid', '') if self.link_state.get('connected') else ''
+        try:
+            value = normalize_mac(value)
+        except ValueError:
+            value = ''
+        if time.monotonic() - self.link_received_at > 3:
+            value = ''
+        if not value:
+            QMessageBox.warning(
+                self, self.tr_text('没有可用 MAC', 'No MAC available'),
+                self.tr_text('尚未核验已连接 AP，请先连接 Wi-Fi。',
+                             'Connect Wi-Fi to verify the associated AP first.'))
+            return
+        self.lineEdit_target_mac.setText(value)
+        self.show_textBrowser_log(self.tr_text(
+            f'目标 MAC 已设为已连接 AP：{value}',
+            f'Target MAC set to associated AP: {value}'))
+
+    def start_static_baseline(self):
+        if self.pushButton_collect_start.text() not in {'开始', 'Start'}:
+            return
+        if not self.experiment_config:
+            QMessageBox.warning(
+                self, self.tr_text('实验 session 未建立', 'No experiment session'),
+            self.tr_text('请先点击“新建实验”或“加载配置”，再采集人员站立静止基线。',
+                         'Select New session or Load before recording the standing-person baseline.'))
+            return
+        self.collection_action_override = 'static'
+        self.collection_role_override = 'static_reference'
+        self.collection_label_override = self.tr_text(
+            '60 秒静态人员基线', '60 s static-person baseline')
+        minimum_s = int(float(self.experiment_config.get('baseline_min_duration_s', 60) or 60))
+        self._baseline_saved_duration = self.spinBox_collect_duration.value()
+        self.spinBox_collect_duration.setValue(max(60, minimum_s))
+        self.spinBox_collect_number.setValue(1)
+        self.update_physics_capture_config()
+        self.pushButton_collect_show()
+        self._restore_reference_duration_if_not_started()
+
+    def start_empty_room_reference(self):
+        if self.pushButton_collect_start.text() not in {'开始', 'Start'}:
+            return
+        if not self.experiment_config:
+            QMessageBox.warning(
+                self, self.tr_text('实验 session 未建立', 'No experiment session'),
+                self.tr_text('请先点击“新建实验”或“加载配置”，再采集空房参考。',
+                             'Select New session or Load before recording the empty-room reference.'))
+            return
+        self.collection_action_override = 'none'
+        self.collection_role_override = 'empty_room_reference'
+        self.collection_label_override = self.tr_text('60 秒空房参考（无人环境）', '60 s empty-room reference')
+        self._baseline_saved_duration = self.spinBox_collect_duration.value()
+        self.timeEdit_collect_delay.setValue(15)
+        self.spinBox_collect_duration.setValue(60)
+        self.spinBox_collect_number.setValue(1)
+        self.update_physics_capture_config()
+        self.pushButton_collect_show()
+        self._restore_reference_duration_if_not_started()
+
+    def _restore_reference_duration_if_not_started(self):
+        if self.pushButton_collect_start.text() not in {'开始', 'Start'}:
+            return
+        if self._baseline_saved_duration is None:
+            return
+        if self.collection_role_override == 'empty_room_reference':
+            self.timeEdit_collect_delay.setValue(3)
+            self.spinBox_collect_duration.setValue(3)
+        else:
+            self.spinBox_collect_duration.setValue(self._baseline_saved_duration)
+        self._baseline_saved_duration = None
+        self.collection_action_override = None
+        self.collection_role_override = None
+        self.collection_label_override = None
+        self.update_physics_capture_config()
+
     def update_serial_connection_ui(self, status=None):
         connected = self.serial_controller.is_connected()
         port = self.serial_controller.port or self.selected_serial_port()
@@ -997,6 +1387,243 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         except Exception as e:
             print(f'Failed to save GUI config: {e}')
 
+    def _data_root_config_value(self):
+        """Keep the built-in output location portable across computers."""
+        root = Path(self.data_root)
+        working_root = Path.cwd().resolve()
+        try:
+            relative_root = root.resolve().relative_to(working_root)
+            return str(relative_root) if str(relative_root) else '.'
+        except (OSError, ValueError):
+            return str(root)
+
+    def _experiment_template(self):
+        template_path = Path(__file__).resolve().parent / 'config' / 'experiment_config.example.json'
+        try:
+            return json.loads(template_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            return {
+                'schema_version': 'csi-experiment-manifest/1.1',
+                'collector_version': 'console-csi-v7-research',
+                'complex_csi_enabled': True,
+                'csi_component_order': 'imag_real_interleaved',
+                'channel_filter_enabled': False,
+                'csi_scale_shift': 0,
+                'calibration_role': 'activity',
+                'require_static_baseline': True,
+                'baseline_min_duration_s': 60,
+                'minimum_target_mac_fraction': 0.95,
+                'minimum_dominant_phy_fraction': 0.95,
+                'minimum_telemetry_samples': 1,
+            }
+
+    def _config_from_ui(self):
+        session_id = self.lineEdit_session_id.text().strip()
+        if not session_id:
+            raise ValueError('请填写 session_id，或点击“新建实验”。')
+        config = dict(self.experiment_config or self._experiment_template())
+        receiver_id = self.lineEdit_receiver_id.text().strip()
+        router_id = self.lineEdit_router_id.text().strip()
+        sender_id = self.lineEdit_sender_id.text().strip()
+        config.update({
+            'participant_id': self.lineEdit_participant_id.text().strip(),
+            'session_id': session_id,
+            'room_id': self.lineEdit_room_id.text().strip(),
+            'site_id': self.lineEdit_room_id.text().strip(),
+            'receiver_id': receiver_id,
+            'router_id': router_id,
+            'sender_id': sender_id,
+            'target_mac': self.lineEdit_target_mac.text().strip(),
+            'distance_m': round(float(self.doubleSpinBox_tx_rx_distance.value()), 2),
+            'csi_output_type': self.csi_output_type,
+            'calibration_role': self.current_calibration_role(),
+            'data_root': self._data_root_config_value(),
+            'send_mode': self.comboBox_send_mode.currentText(),
+            'complex_csi_enabled': self.checkBox_complex_csi.isChecked(),
+            'date': datetime.now().strftime('%Y-%m-%d'),
+        })
+        config.update(session_identity_metadata(
+            session_id, receiver_id, router_id, sender_id))
+        return acquisition_defaults(config)
+
+    def _apply_experiment_config(self, config, path=None):
+        if self.pushButton_collect_start.text() not in {'开始', 'Start'}:
+            QMessageBox.warning(self, self.tr_text('采集进行中', 'Capture in progress'),
+                                 self.tr_text('请先停止当前 trial，再切换实验配置。',
+                                              'Stop the current trial before changing the experiment config.'))
+            return False
+        self.experiment_config = dict(config)
+        self.experiment_config.setdefault('empty_room_min_duration_s', 60)
+        self.experiment_config_path = Path(path).resolve() if path else None
+        self.data_root = resolve_data_root(config.get('data_root', self.data_root))
+        self.experiment_config['data_root'] = self._data_root_config_value()
+        self.lineEdit_data_root.setText(self.data_root)
+        self.lineEdit_session_id.setText(str(config.get('session_id', '')))
+        self.lineEdit_participant_id.setText(str(config.get('participant_id', '')))
+        self.lineEdit_room_id.setText(str(config.get('room_id', '')))
+        self.lineEdit_receiver_id.setText(str(config.get('receiver_id', '')))
+        self.lineEdit_router_id.setText(str(config.get('router_id', '')))
+        self.lineEdit_sender_id.setText(str(config.get('sender_id', '')))
+        self.lineEdit_target_mac.setText(str(config.get('target_mac', '')))
+        try:
+            self.doubleSpinBox_tx_rx_distance.setValue(float(config.get('distance_m', 0) or 0))
+        except (TypeError, ValueError):
+            self.doubleSpinBox_tx_rx_distance.setValue(0.0)
+        send_mode = str(config.get('send_mode', 'router_ping'))
+        mode_index = self.comboBox_send_mode.findText(send_mode)
+        if mode_index >= 0:
+            self.comboBox_send_mode.setCurrentIndex(mode_index)
+        self.csi_output_type = str(config.get('csi_output_type', self.csi_output_type))
+        self.serial_controller.set_experiment_context(self.experiment_config, self.data_root)
+        self.pushButton_collect_clean.setEnabled(False)
+        self.setWindowTitle(
+            f"ESP CSI 研究采集 - {self.experiment_config.get('session_id', '')} - "
+            f"{self.experiment_config.get('participant_id', '')} - "
+            f"{self.experiment_config.get('room_id', '')} - "
+            f"{self.experiment_config.get('receiver_id', '')}"
+        )
+        self.save_gui_config(data_root=self._data_root_config_value())
+        self.refresh_baseline_status()
+        return True
+
+    def new_experiment_config(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.tr_text('新建实验 session', 'New experiment session'))
+        form = QFormLayout(dialog)
+        fields = {}
+        defaults = {
+            'session_id': self.lineEdit_session_id.text().strip(),
+            'participant_id': self.lineEdit_participant_id.text().strip(),
+            'room_id': self.lineEdit_room_id.text().strip(),
+            'receiver_id': self.lineEdit_receiver_id.text().strip(),
+            'router_id': self.lineEdit_router_id.text().strip(),
+            'sender_id': self.lineEdit_sender_id.text().strip(),
+            'target_mac': self.lineEdit_target_mac.text().strip(),
+        }
+        labels = {
+            'session_id': 'session_id', 'participant_id': 'participant_id',
+            'room_id': 'room_id', 'receiver_id': 'receiver_id',
+            'router_id': 'router_id', 'sender_id': self.tr_text('sender_id（可选）', 'sender_id (optional)'),
+            'target_mac': self.tr_text('目标发送 MAC', 'Target source MAC'),
+        }
+        for key in ('session_id', 'participant_id', 'room_id', 'receiver_id',
+                    'router_id', 'sender_id', 'target_mac'):
+            editor = QLineEdit(dialog)
+            editor.setText(defaults[key])
+            fields[key] = editor
+            form.addRow(labels[key], editor)
+        distance = QDoubleSpinBox(dialog)
+        distance.setRange(0.01, 1000.0)
+        distance.setDecimals(2)
+        distance.setValue(max(0.01, self.doubleSpinBox_tx_rx_distance.value()))
+        form.addRow(self.tr_text('收发距离（米）', 'Tx/Rx distance (m)'), distance)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        required = ('session_id', 'participant_id', 'room_id', 'receiver_id', 'router_id', 'target_mac')
+        missing = [key for key in required if not fields[key].text().strip()]
+        if missing:
+            QMessageBox.warning(
+                self, self.tr_text('配置不完整', 'Incomplete config'),
+                self.tr_text(f"以下字段不能为空：{', '.join(missing)}",
+                             f"Required fields are empty: {', '.join(missing)}"))
+            return
+        self.lineEdit_session_id.setText(fields['session_id'].text().strip())
+        self.lineEdit_participant_id.setText(fields['participant_id'].text().strip())
+        self.lineEdit_room_id.setText(fields['room_id'].text().strip())
+        self.lineEdit_receiver_id.setText(fields['receiver_id'].text().strip())
+        self.lineEdit_router_id.setText(fields['router_id'].text().strip())
+        self.lineEdit_sender_id.setText(fields['sender_id'].text().strip())
+        self.lineEdit_target_mac.setText(fields['target_mac'].text().strip())
+        self.doubleSpinBox_tx_rx_distance.setValue(distance.value())
+        try:
+            config = self._config_from_ui()
+            default_path = (Path(__file__).resolve().parent / 'config' / 'sessions'
+                            / f"{config['session_id']}.json")
+            default_path.parent.mkdir(parents=True, exist_ok=True)
+            default_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+            config = load_experiment_config(default_path)
+            config['data_root'] = self.data_root
+            self._apply_experiment_config(config, default_path)
+            self.show_textBrowser_log(self.tr_text(
+                f'新 session 已创建：{config["session_id"]}；配置：{default_path}',
+                f'New session created: {config["session_id"]}; config: {default_path}'))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, self.tr_text('配置错误', 'Config error'), str(exc))
+
+    def load_experiment_config_dialog(self):
+        default_dir = Path(__file__).resolve().parent / 'config' / 'sessions'
+        default_dir.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(
+            self, self.tr_text('加载实验配置', 'Load experiment config'),
+            str(default_dir), 'JSON (*.json)')
+        if not path:
+            return
+        try:
+            config = load_experiment_config(path)
+            if 'data_root' not in config:
+                config['data_root'] = self.data_root
+            self._apply_experiment_config(config, path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.critical(self, self.tr_text('配置加载失败', 'Config load failed'), str(exc))
+
+    def save_experiment_config_dialog(self):
+        try:
+            config = self._config_from_ui()
+        except (TypeError, ValueError) as exc:
+            QMessageBox.warning(self, self.tr_text('配置错误', 'Config error'), str(exc))
+            return
+        default_dir = Path(__file__).resolve().parent / 'config' / 'sessions'
+        default_dir.mkdir(parents=True, exist_ok=True)
+        default_path = self.experiment_config_path or (default_dir / f"{config['session_id']}.json")
+        path, _ = QFileDialog.getSaveFileName(
+            self, self.tr_text('保存实验配置', 'Save experiment config'),
+            str(default_path), 'JSON (*.json)')
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() != '.json':
+            path = path.with_suffix('.json')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+        config = load_experiment_config(path)
+        config['data_root'] = self.data_root
+        self.experiment_config_path = path.resolve()
+        self._apply_experiment_config(config, path)
+        self.show_textBrowser_log(self.tr_text(
+            f'实验配置已保存：{path}', f'Experiment config saved: {path}'))
+
+    def choose_data_root(self):
+        if self.pushButton_collect_start.text() not in {'开始', 'Start'}:
+            QMessageBox.warning(self, self.tr_text('采集进行中', 'Capture in progress'),
+                                 self.tr_text('请先停止当前 trial，再切换输出目录。',
+                                              'Stop the current trial before changing the output root.'))
+            return
+        path = QFileDialog.getExistingDirectory(
+            self, self.tr_text('选择输出根目录', 'Choose data root'),
+            str(Path(self.data_root).resolve()))
+        if path:
+            self.data_root = str(Path(path).resolve())
+            self.lineEdit_data_root.setText(self.data_root)
+            self.save_gui_config(data_root=self._data_root_config_value())
+            if self.experiment_config is not None:
+                self.experiment_config['data_root'] = self.data_root
+                self.serial_controller.set_experiment_context(self.experiment_config, self.data_root)
+
+    def save_wifi_preferences(self, _checked=None):
+        updates = {
+            'router_ssid': self.lineEdit_router_ssid.text(),
+            'remember_password': self.checkBox_remember_password.isChecked(),
+        }
+        if self.checkBox_remember_password.isChecked():
+            updates['router_password'] = self.lineEdit_router_password.text()
+        else:
+            self.gui_config.pop('router_password', None)
+        self.save_gui_config(**updates)
+
     def change_language(self, index):
         self.language = 'en' if index == 1 else 'zh'
         self.save_gui_config(language=self.language)
@@ -1011,8 +1638,16 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.groupBox_16.setTitle('Device commands' if en else '设备命令')
         self.groupBox_11.setTitle('Wi-Fi access point (router / ESP32 SoftAP)' if en else 'Wi-Fi 接入点（路由器 / ESP32 SoftAP）')
         self.label_duration_2.setText('Password' if en else '密码')
+        self.pushButton_wifi_scan.setText('Scan Wi-Fi' if en else '扫描 Wi-Fi')
+        self.label_wifi_network.setText('Wi-Fi' if en else 'Wi-Fi')
+        if self.comboBox_wifi_network.count() == 1:
+            self.comboBox_wifi_network.setItemText(
+                0, 'Scan and select Wi-Fi' if en else '扫描后选择 Wi-Fi')
+        if self.label_wifi_status.text() in {'未验证', 'Not verified'}:
+            self.label_wifi_status.setText('Not verified' if en else '未验证')
         self.label_send_mode.setText('Trigger' if en else '触发方式')
         self.checkBox_router_auto_connect.setText('Auto connect' if en else '自动连接')
+        self.checkBox_remember_password.setText('Remember password' if en else '记住密码')
         self.label.setText('Custom command' if en else '自定义命令')
         self.groupBox_13.setTitle('Runtime log' if en else '运行日志')
         self.groupBox_radioHeader.setTitle('Receiver information' if en else '接收信息')
@@ -1034,32 +1669,43 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.pushButton_statistics_config.setText('Update' if en else '更新')
         self.groupBox_18.setTitle('Collection' if en else '采集')
         self.label_participant_id.setText('Participant label (participant_id)' if en else '人员标签（participant_id）')
+        self.label_session_id.setText('Session ID' if en else '会话编号（session_id）')
         self.label_room_id.setText('Location label (room_id)' if en else '地点标签（room_id）')
         self.label_receiver_id.setText('Device label (receiver_id)' if en else '设备标签（receiver_id）')
+        self.label_router_id.setText('Router label (router_id)' if en else '路由器标签（router_id）')
+        self.label_sender_id.setText('Sender label (sender_id)' if en else '发送端标签（sender_id）')
+        self.label_target_mac.setText('Target source MAC' if en else '目标发送 MAC')
+        empty_room_index = self.comboBox_collect_target.findData('empty_room_reference')
+        if empty_room_index >= 0:
+            self.comboBox_collect_target.setItemText(
+                empty_room_index, self.tr_text('空房参考（无人环境）', 'Empty-room reference (no person)'))
+        self.pushButton_use_current_mac.setText('Connected AP' if en else '已连接 AP')
+        self.label_session_controls.setText('Experiment' if en else '实验配置')
+        self.pushButton_new_experiment.setText('New session' if en else '新建实验')
+        self.pushButton_load_experiment.setText('Load' if en else '加载配置')
+        self.pushButton_save_experiment.setText('Save' if en else '保存配置')
+        self.label_data_root.setText('CSI data output root' if en else 'CSI数据输出根目录')
+        self.pushButton_choose_data_root.setText('Choose folder' if en else '选择目录')
+        self.pushButton_static_baseline.setText(
+            'Record 60 s standing-person baseline' if en else '采集 60 秒人员站立静止基线')
+        self.pushButton_empty_room.setText('Record 60 s empty room' if en else '采集 60 秒空房参考')
         self.label_tx_rx_distance.setText('Tx_Rx_Dis (m)' if en else 'Tx_Rx_Dis（米）')
         self.label_complex_csi.setText('Physics CSI' if en else '物理 CSI')
         self.checkBox_complex_csi.setText('Save complex I/Q' if en else '保存复数 I/Q')
-        role = self.comboBox_calibration_role.currentData()
-        role_labels = (['Activity', 'Empty-room reference', 'Static-person reference'] if en else
-                       ['动作采集', '空房参考', '静止人员参考'])
-        for index, label in enumerate(role_labels):
-            self.comboBox_calibration_role.setItemText(index, label)
-        role_index = self.comboBox_calibration_role.findData(role)
-        if role_index >= 0:
-            self.comboBox_calibration_role.setCurrentIndex(role_index)
-        self.label_target_4.setText('Activity label' if en else '采集动作')
+        self.label_target_4.setText('Collection item' if en else '采集项目')
         self.label_delay.setText('Wait before each trial' if en else '每次等待')
         self.label_duration.setText('Collection duration' if en else '采集时长')
         self.label_number.setText('Number of trials' if en else '采集次数')
         self.timeEdit_collect_delay.setSuffix(' s')
         self.spinBox_collect_duration.setSuffix(' s')
-        current_action = self.comboBox_collect_target.currentData()
-        labels = CSI_DATA_TARGET_LABELS_EN if en else CSI_DATA_TARGET_LABELS_ZH
-        for index, label in enumerate(labels):
+        current_item = self.comboBox_collect_target.currentData()
+        for index, item in enumerate(COLLECTION_ITEMS):
+            label = self.tr_text('空房参考（无人环境）', 'Empty-room reference (no person)') \
+                if item[0] == 'empty_room_reference' else (item[4] if en else item[3])
             self.comboBox_collect_target.setItemText(index, label)
-        action_index = self.comboBox_collect_target.findData(current_action)
-        if action_index >= 0:
-            self.comboBox_collect_target.setCurrentIndex(action_index)
+        item_index = self.comboBox_collect_target.findData(current_item)
+        if item_index >= 0:
+            self.comboBox_collect_target.setCurrentIndex(item_index)
         command_labels = COMMAND_LABELS_EN if en else [item[1] for item in COMMAND_OPTIONS]
         for index, label in enumerate(command_labels):
             self.comboBox_command.setItemText(index, label)
@@ -1067,8 +1713,13 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         for index, label in enumerate(modes):
             self.comboBox_statistics_mode.setItemText(index, label)
         self.lineEdit_participant_id.setPlaceholderText('e.g. P001' if en else '例如 P001')
+        self.lineEdit_session_id.setPlaceholderText('e.g. P001-R01-D01-S01' if en else '例如 P001-R01-D01-S01')
         self.lineEdit_room_id.setPlaceholderText('e.g. R01 / LAB-A' if en else '例如 R01 / LAB-A')
         self.lineEdit_receiver_id.setPlaceholderText('e.g. ESP32-RX-01' if en else '例如 ESP32-RX-01')
+        self.lineEdit_router_id.setPlaceholderText('e.g. AP-01' if en else '例如 AP-01')
+        self.lineEdit_sender_id.setPlaceholderText('e.g. ESP32-TX-01 (optional)' if en else '例如 ESP32-TX-01（可选）')
+        self.lineEdit_target_mac.setPlaceholderText('aa:bb:cc:dd:ee:ff')
+        self.refresh_baseline_status()
         self.doubleSpinBox_tx_rx_distance.setSuffix(' m')
         collecting = self.pushButton_collect_start.text() in {'停止', 'Stop'}
         self.pushButton_collect_start.setText(('Stop' if en else '停止') if collecting else ('Start' if en else '开始'))
@@ -1388,9 +2039,22 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
                 f"radar --send_data_interval {int(self.experiment_config['send_interval_ms'])}"
             )
 
+        if self.comboBox_send_mode.currentText() == 'espnow_research':
+            self.timer_boot_command.stop()
+            return
         if (self.boot_command_attempts == 1 and self.checkBox_router_auto_connect.isChecked()
                 and len(self.lineEdit_router_ssid.text()) > 0):
             self.command_router_connect()
+        elif self.boot_command_attempts == 1 and not self.checkBox_router_auto_connect.isChecked():
+            # The board may still be connected from an earlier command in the
+            # same power cycle. Make the GUI option authoritative whenever a
+            # serial session starts.
+            self.serial_queue_write.put('wifi_config --disconnect')
+            self.pushButton_router_connect.setText(self.tr_text('连接', 'Connect'))
+            self.pushButton_router_connect.setStyleSheet('color: black')
+            self.label_wifi_status.setText(self.tr_text('未连接（自动连接已关闭）',
+                                                        'Disconnected (auto connect off)'))
+            self.label_wifi_status.setStyleSheet('color: #666;')
 
         if self.boot_command_attempts >= 3:
             self.timer_boot_command.stop()
@@ -1408,9 +2072,9 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             self.pushButton_router_connect.setText(self.tr_text('断开', 'Disconnect'))
             self.pushButton_router_connect.setStyleSheet('color: red')
 
-            command = 'wifi_config --ssid ' + ("\"%s\"" % self.lineEdit_router_ssid.text())
+            command = 'wifi_config --ssid ' + self._console_quote(self.lineEdit_router_ssid.text())
             if len(self.lineEdit_router_password.text()) >= 8:
-                command += ' --password ' + self.lineEdit_router_password.text()
+                command += ' --password ' + self._console_quote(self.lineEdit_router_password.text())
             self.serial_queue_write.put(command)
         else:
             self.pushButton_router_connect.setText(self.tr_text('连接', 'Connect'))
@@ -1423,17 +2087,25 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             command = 'radar --csi_output_type ' + self.csi_output_type + ' --csi_output_format base64'
             self.serial_queue_write.put(command)
 
-        self.save_gui_config(
-            router_ssid=self.lineEdit_router_ssid.text(),
-            router_password=self.lineEdit_router_password.text(),
-        )
+        self.save_wifi_preferences()
 
     def command_send_mode(self):
         if not self.serial_controller.is_connected():
             return
         mode = self.comboBox_send_mode.currentText().strip()
-        self.serial_queue_write.put(f'radar --send_mode {mode}')
+        if mode != 'espnow_research':
+            self.serial_queue_write.put(f'radar --send_mode {mode}')
+        else:
+            self.show_textBrowser_log(
+                'ESP-NOW 研究模式由接收端编译配置启用，不发送运行时 radar --send_mode 命令。')
         self.save_gui_config(send_mode=mode)
+        if self.experiment_config:
+            self.experiment_config['send_mode'] = mode
+            self.refresh_baseline_status()
+
+    def change_send_mode(self, mode):
+        self.comboBox_send_mode.setCurrentText(mode)
+        self.command_send_mode()
 
     def command_custom(self):
         command = self.lineEdit_command.text()
@@ -1446,12 +2118,15 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.serial_queue_write.put(command)
 
     def command_collect_target_start(self):
-        action = self.comboBox_collect_target.currentData()
+        action = self.current_collection_action()
         duration_ms = self.spinBox_collect_duration.value() * 1000
         # Send one acquisition at a time so the configured waiting period can
         # be inserted between every two trials.
+        # esp_console treats whitespace as an argument separator, so quote
+        # labels such as "stand up" as one firmware argument.
+        action_arg = '"' + str(action).replace('"', '\\"') + '"'
         command = (f'radar --collect_number 1' +
-                   f' --collect_tagets {action}' +
+                   f' --collect_tagets {action_arg}' +
                    f' --collect_duration {duration_ms}')
         self.serial_queue_write.put(command)
 
@@ -1495,15 +2170,40 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
     def set_collect_inputs_enabled(self, enabled):
         for widget in (
             self.lineEdit_participant_id, self.lineEdit_room_id, self.lineEdit_receiver_id,
+            self.lineEdit_router_id, self.lineEdit_sender_id, self.lineEdit_target_mac,
+            self.pushButton_use_current_mac, self.pushButton_static_baseline,
+            self.pushButton_empty_room,
             self.comboBox_collect_target, self.timeEdit_collect_delay,
             self.spinBox_collect_duration, self.spinBox_collect_number,
-            self.checkBox_complex_csi, self.comboBox_calibration_role,
+            self.checkBox_complex_csi, self.comboBox_send_mode,
+            self.pushButton_new_experiment, self.pushButton_load_experiment,
+            self.pushButton_save_experiment, self.pushButton_choose_data_root,
+            self.lineEdit_data_root,
         ):
             widget.setEnabled(enabled)
+        self.pushButton_empty_room.setEnabled(enabled)
+
+    def selected_collection_action(self):
+        return self.comboBox_collect_target.currentData(Qt.UserRole + 1) or 'unknown'
+
+    def selected_calibration_role(self):
+        return self.comboBox_collect_target.currentData(Qt.UserRole + 2) or 'activity'
+
+    def current_collection_action(self):
+        return self.collection_action_override or self.selected_collection_action()
+
+    def current_calibration_role(self):
+        return self.collection_role_override or self.selected_calibration_role()
+
+    def collection_item_changed(self):
+        self.collection_action_override = None
+        self.collection_role_override = None
+        self.collection_label_override = None
+        self.update_physics_capture_config()
 
     def update_physics_capture_config(self):
         enabled = self.checkBox_complex_csi.isChecked()
-        role = self.comboBox_calibration_role.currentData() or 'activity'
+        role = self.current_calibration_role()
         if self.experiment_config is not None:
             self.experiment_config['complex_csi_enabled'] = enabled
             self.experiment_config['csi_component_order'] = 'imag_real_interleaved'
@@ -1515,38 +2215,69 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             'complex_csi_enabled': enabled,
             'calibration_role': role,
         })
-        self.save_gui_config(complex_csi_enabled=enabled, calibration_role=role)
+        self.save_gui_config(
+            complex_csi_enabled=enabled,
+            calibration_role=self.selected_calibration_role(),
+            collect_action=self.selected_collection_action(),
+            collection_item=self.comboBox_collect_target.currentData() or 'unknown',
+        )
 
     def apply_collection_metadata(self):
         participant_id = self.lineEdit_participant_id.text().strip()
+        session_id = self.lineEdit_session_id.text().strip()
         room_id = self.lineEdit_room_id.text().strip()
         receiver_id = self.lineEdit_receiver_id.text().strip()
+        router_id = self.lineEdit_router_id.text().strip()
+        sender_id = self.lineEdit_sender_id.text().strip()
+        try:
+            target_mac = normalize_mac(self.lineEdit_target_mac.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, '目标 MAC 格式错误', str(exc))
+            return False
         tx_rx_distance = round(float(self.doubleSpinBox_tx_rx_distance.value()), 2)
-        if not participant_id or not room_id or not receiver_id:
-            QMessageBox.warning(self, '采集标签缺失', '请输入人员、地点和设备标签后再开始采集。')
+        if not participant_id or not session_id or not room_id or not receiver_id or not router_id or not target_mac:
+            QMessageBox.warning(
+                self, '采集标签缺失',
+                '请输入人员、session、地点、接收设备、路由器标签和目标发送 MAC 后再开始采集。')
             return False
         if tx_rx_distance <= 0:
             QMessageBox.warning(self, '距离未设置', '请输入发射端与接收端之间的直线距离，必须大于 0 米。')
             return False
         compact_id = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
         if (not compact_id.fullmatch(participant_id) or not compact_id.fullmatch(room_id)
-                or not compact_id.fullmatch(receiver_id)):
+                or not compact_id.fullmatch(receiver_id) or not compact_id.fullmatch(router_id)
+                or (sender_id and not compact_id.fullmatch(sender_id))):
             QMessageBox.warning(
                 self, '采集标签格式错误',
                 "人员、地点和设备标签只能包含英文字母、数字、'.'、'_'、'-'，最长 64 个字符。"
             )
             return False
         if self.experiment_config:
+            if session_id != str(self.experiment_config.get('session_id', '')):
+                QMessageBox.warning(
+                    self, 'session 已改变',
+                    '请点击“新建实验”创建新的 session，不要在当前 session 中途改编号。')
+                return False
             old_participant = str(self.experiment_config.get('participant_id', ''))
             old_room = str(self.experiment_config.get('room_id', ''))
             old_receiver = str(self.experiment_config.get('receiver_id', ''))
+            old_router = str(self.experiment_config.get('router_id', ''))
+            old_sender = str(self.experiment_config.get('sender_id', ''))
+            old_target_mac = str(self.experiment_config.get('target_mac', ''))
             old_distance = round(float(self.experiment_config.get('distance_m', 0) or 0), 2)
             if (participant_id != old_participant or room_id != old_room
-                    or receiver_id != old_receiver or tx_rx_distance != old_distance):
+                    or receiver_id != old_receiver or router_id != old_router
+                    or sender_id != old_sender or target_mac != old_target_mac
+                    or tx_rx_distance != old_distance):
                 updated_config = dict(self.experiment_config)
                 updated_config['participant_id'] = participant_id
                 updated_config['room_id'] = room_id
                 updated_config['receiver_id'] = receiver_id
+                updated_config['router_id'] = router_id
+                updated_config['sender_id'] = sender_id
+                updated_config['target_mac'] = target_mac
+                updated_config['site_id'] = room_id
+                updated_config['device_pair_id'] = f"{receiver_id}__{sender_id or router_id}"
                 updated_config['distance_m'] = tx_rx_distance
                 updated_config['date'] = datetime.now().strftime('%Y-%m-%d')
                 try:
@@ -1571,16 +2302,36 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             'participant_id': participant_id,
             'room_id': room_id,
             'receiver_id': receiver_id,
+            'router_id': router_id,
+            'sender_id': sender_id,
+            'target_mac': target_mac,
+            'send_mode': self.comboBox_send_mode.currentText(),
             'distance_m': tx_rx_distance,
             'complex_csi_enabled': self.checkBox_complex_csi.isChecked(),
-            'calibration_role': self.comboBox_calibration_role.currentData() or 'activity',
+            'calibration_role': self.current_calibration_role(),
         })
         try:
             self.save_gui_config(participant_id=participant_id, room_id=room_id,
-                                 receiver_id=receiver_id, distance_m=tx_rx_distance)
+                                 receiver_id=receiver_id, router_id=router_id,
+                                 sender_id=sender_id, target_mac=target_mac,
+                                 session_id=session_id, distance_m=tx_rx_distance,
+                                 data_root=self.data_root)
         except Exception as e:
             self.show_textBrowser_log(f'<font color="yellow">无法保存人员/地点默认值：{e}</font>')
         return True
+
+    def _persist_current_experiment_config(self):
+        if not self.experiment_config or not self.experiment_config_path:
+            return
+        config = self._config_from_ui()
+        path = Path(self.experiment_config_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+        config = load_experiment_config(path)
+        config['data_root'] = self.data_root
+        self.experiment_config = config
+        self.serial_controller.experiment_config = config
+        self.serial_controller.data_root = str(self.data_root)
 
     def collect_delay_tick(self):
         self.collect_delay_remaining -= 1
@@ -1652,47 +2403,116 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
             self.command_collect_target_stop()
         self.hide_collect_overlay()
         self.spinBox_collect_number.setValue(self.collect_saved_number)
-        self.timeEdit_collect_delay.setValue(self.collect_saved_delay)
+        if self._baseline_saved_duration is not None:
+            if self.collection_role_override == 'empty_room_reference':
+                self.timeEdit_collect_delay.setValue(3)
+                self.spinBox_collect_duration.setValue(3)
+            else:
+                self.spinBox_collect_duration.setValue(self._baseline_saved_duration)
+            self._baseline_saved_duration = None
+        if self.collection_role_override != 'empty_room_reference':
+            self.timeEdit_collect_delay.setValue(self.collect_saved_delay)
         self.spinBox_collect_number.setStyleSheet('color: black')
         self.timeEdit_collect_delay.setStyleSheet('color: black')
         self.pushButton_collect_start.setStyleSheet('color: black')
         self.pushButton_collect_start.setText(self.tr_text('开始', 'Start'))
         self.set_collect_inputs_enabled(True)
+        self.pushButton_empty_room.setEnabled(True)
+        self.pushButton_static_baseline.setEnabled(True)
+        self.collection_action_override = None
+        self.collection_role_override = None
+        self.collection_label_override = None
+        self.update_physics_capture_config()
+        QTimer.singleShot(1500, self.refresh_baseline_status)
 
     def pushButton_collect_show(self):
         if self.pushButton_collect_start.text() in {'开始', 'Start'}:
-            if self.comboBox_collect_target.currentIndex() == 0 or self.spinBox_collect_number.value() == 0:
+            if self.experiment_config is None:
+                QMessageBox.warning(
+                    self, self.tr_text('需要实验 session', 'Experiment session required'),
+                    self.tr_text('请先点击“新建实验”或“加载配置”，再开始正式采集。',
+                                 'Create or load an experiment session before formal collection.'))
+                return
+            no_collection_item = (
+                self.collection_action_override is None
+                and self.comboBox_collect_target.currentIndex() == 0)
+            if no_collection_item or self.spinBox_collect_number.value() == 0:
                 err = QErrorMessage(self)
                 err.setWindowTitle('采集参数错误')
                 err.showMessage(
-                    '请选择采集动作，并确认采集次数大于 0。')
+                    '请选择采集项目，并确认采集次数大于 0。')
                 err.show()
                 return
 
-            if not self.apply_collection_metadata():
+            capture_config = acquisition_defaults(dict(self.experiment_config or {}))
+            capture_config.update(target_mac=self.lineEdit_target_mac.text().strip().lower(),
+                                  send_mode=self.comboBox_send_mode.currentText())
+            current_link = dict(self.link_state)
+            current_link['telemetry_age_s'] = current_link.get('telemetry_age_s', 99) + time.monotonic() - self.link_received_at
+            error = preflight_error(capture_config, current_link)
+            if error:
+                QMessageBox.warning(self, '采集条件未满足', error)
+                self._restore_reference_duration_if_not_started()
                 return
+            self.experiment_config.update(capture_config)
+            if not self.apply_collection_metadata():
+                self.collection_action_override = None
+                self.collection_role_override = None
+                self.collection_label_override = None
+                self.update_physics_capture_config()
+                self._restore_reference_duration_if_not_started()
+                return
+
+            if self.experiment_config is not None:
+                try:
+                    self._persist_current_experiment_config()
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    QMessageBox.warning(self, '配置保存失败', f'无法保存当前 session 配置：{exc}')
+                    self._restore_reference_duration_if_not_started()
+                    return
+
+            role = self.current_calibration_role()
+            if self.experiment_config and role == 'activity' and bool(
+                    self.experiment_config.get('require_static_baseline', True)):
+                baseline = session_baseline_status(
+                    self._session_collection_root(), self.experiment_config)
+                if not baseline['ready']:
+                    QMessageBox.warning(
+                        self, self.tr_text('静态基线未完成', 'Static baseline missing'),
+                        self.tr_text(
+                            f"请先点击“采集 60 秒人员站立静止基线”。当前状态：{baseline['reason']}",
+                            f"Record the 60 s standing-person baseline first. Current status: {baseline['reason']}"))
+                    self.refresh_baseline_status()
+                    self._restore_reference_duration_if_not_started()
+                    return
 
             self.collect_saved_number = self.spinBox_collect_number.value()
             self.collect_saved_delay = self.timeEdit_collect_delay.value()
             self.collect_total_trials = self.collect_saved_number
             self.collect_current_trial = 1
-            self.collect_action_label = self.comboBox_collect_target.currentText()
+            self.collect_action_label = self.collection_label_override or self.comboBox_collect_target.currentText()
             self.save_gui_config(
                 participant_id=self.lineEdit_participant_id.text().strip(),
                 room_id=self.lineEdit_room_id.text().strip(),
                 receiver_id=self.lineEdit_receiver_id.text().strip(),
-                collect_action=self.comboBox_collect_target.currentData(),
+                router_id=self.lineEdit_router_id.text().strip(),
+                sender_id=self.lineEdit_sender_id.text().strip(),
+                target_mac=self.lineEdit_target_mac.text().strip().lower(),
+                collection_item=self.comboBox_collect_target.currentData(),
+                collect_action=self.selected_collection_action(),
                 collect_wait_seconds=self.timeEdit_collect_delay.value(),
                 collect_duration_seconds=self.spinBox_collect_duration.value(),
                 collect_number=self.spinBox_collect_number.value(),
                 distance_m=round(float(self.doubleSpinBox_tx_rx_distance.value()), 2),
                 complex_csi_enabled=self.checkBox_complex_csi.isChecked(),
-                calibration_role=self.comboBox_calibration_role.currentData() or 'activity',
+                calibration_role=self.selected_calibration_role(),
             )
             self.pushButton_collect_start.setText(self.tr_text('停止', 'Stop'))
             self.pushButton_collect_start.setStyleSheet('color: red')
             self.timeEdit_collect_delay.setStyleSheet('color: red')
             self.set_collect_inputs_enabled(False)
+            self.pushButton_empty_room.setEnabled(False)
+            self.pushButton_static_baseline.setEnabled(False)
             self.pushButton_collect_start.setEnabled(True)
             self.start_collection_wait()
         else:
@@ -1780,22 +2600,108 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
         self.lineEdit_command.setText(self.comboBox_command.currentData() or '')
 
     def show_textBrowser_log(self, str):
+        plain = re.sub(r'<[^>]+>', '', str)
+        if plain.startswith('__LINK__:'):
+            state = json.loads(plain[len('__LINK__:'):])
+            previous = self.link_state.get('bssid')
+            self.link_state = state
+            self.link_received_at = time.monotonic()
+            dedicated = state.get('mode') == 'espnow_research'
+            if not dedicated and state.get('bssid') and state['bssid'] != previous:
+                self.lineEdit_target_mac.setText(state['bssid'])
+                self.textBrowser_log.append(f"已核验 AP：{state['ssid']} / {state['bssid']}；预览仅显示该来源。")
+                g_csi_amplitude_array.fill(0)
+                g_rssi_array.fill(0)
+            rate = state.get('target_rate_hz', 0)
+            self.label_wifi_status.setText(f"ESP-NOW 目标：{rate:.1f} Hz" if dedicated else
+                                          (f"目标 AP：{rate:.1f} Hz" if state.get('connected') else 'Wi-Fi 未连接'))
+            self.label_wifi_status.setStyleSheet('color: green' if rate >= 50 else 'color: #b00020')
+            return
+        if plain.startswith('__REJECTED__:'):
+            if self.pushButton_collect_start.text() not in {'开始', 'Start'}:
+                self.finish_collection(send_stop=True)
+            QMessageBox.warning(self, '采集已停止', plain[len('__REJECTED__:'):])
+            return
+        if plain.startswith('__QUALITY__:'):
+            result = json.loads(plain[len('__QUALITY__:'):])
+            self.textBrowser_log.append(f"采集质量：{result['quality_status']}；{result['quality_reasons']}；"
+                                        + ('请补采该段。' if result.get('needs_retake') else '已保存。'))
+            self.refresh_baseline_status()
+            return
+        if '__WIFI_IP__' in plain:
+            self.label_wifi_status.setText(self.tr_text('Wi-Fi 密码正确，已获取 IP', 'Wi-Fi password accepted, IP acquired'))
+            self.label_wifi_status.setStyleSheet('color: green; font-weight: 600;')
+            self.textBrowser_log.append(self.tr_text('Wi-Fi 密码正确，已获取 IP 地址', 'Wi-Fi password accepted, IP address acquired'))
+            return
+        csi_status = re.search(r'__CSI_STATUS__:(\d+):([^:]*):(\d+):(\d+):(\d+):(\d+)', plain)
+        if csi_status:
+            received = int(csi_status.group(1))
+            send_mode = csi_status.group(2)
+            null_tx = int(csi_status.group(3))
+            null_tx_errors = int(csi_status.group(4))
+            null_responses = int(csi_status.group(5))
+            wifi_connected = bool(int(csi_status.group(6)))
+            if send_mode == 'espnow_research':
+                display = f"ESP-NOW CSI：{received} 帧；目标 {self.link_state.get('target_rate_hz', 0):.1f} Hz"
+                self.label_wifi_status.setText(display)
+            elif not wifi_connected:
+                display = self.tr_text('Wi-Fi 未连接，CSI 已停止',
+                                       'Wi-Fi disconnected, CSI stopped')
+                self.label_wifi_status.setText(display)
+                self.label_wifi_status.setStyleSheet('color: #666;')
+            elif received > 0:
+                display = self.tr_text(f'CSI 已接收：{received} 帧', f'CSI received: {received} frames')
+                self.label_wifi_status.setText(f"目标 AP：{self.link_state.get('target_rate_hz', 0):.1f} Hz")
+                self.label_wifi_status.setStyleSheet('color: green' if self.link_state.get('target_rate_hz', 0) >= 50 else 'color: #b00020')
+            else:
+                display = self.tr_text(
+                    'Wi-Fi 已连接，但当前没有 CSI 帧；请检查触发流量/AP 信道',
+                    'Wi-Fi connected, but no CSI frames; check trigger traffic/AP channel')
+            if wifi_connected and send_mode == 'null_data':
+                display += self.tr_text(
+                    f'；Null发送={null_tx}，发送失败={null_tx_errors}，响应候选={null_responses}',
+                    f'; Null TX={null_tx}, TX errors={null_tx_errors}, response candidates={null_responses}')
+            self.textBrowser_log.append(display)
+            return
+        scan_match = re.search(r'Router, ssid:\s*(.*?), bssid:.*?, channel:\s*(\d+), rssi:\s*(-?\d+)', plain)
+        if scan_match:
+            ssid = scan_match.group(1).strip()
+            channel = int(scan_match.group(2))
+            if channel > 14:
+                return
+            display_ssid = f'{ssid} (ch {channel}, {scan_match.group(3)} dBm)'
+            if ssid and self.comboBox_wifi_network.findData(ssid) < 0:
+                if self.comboBox_wifi_network.count() == 1 and self.comboBox_wifi_network.itemText(0).startswith(('扫描', '正在', 'Scan', 'Scanning')):
+                    self.comboBox_wifi_network.clear()
+                self.comboBox_wifi_network.addItem(display_ssid, ssid)
+        if 'IP_EVENT_STA_GOT_IP' in plain:
+            self.label_wifi_status.setText(self.tr_text('Wi-Fi 密码正确，已获取 IP', 'Wi-Fi password accepted, IP acquired'))
+            self.label_wifi_status.setStyleSheet('color: green; font-weight: 600;')
+        elif 'sta disconnected' in plain or 'disconnect' in plain.lower() and 'wifi' in plain.lower():
+            self.label_wifi_status.setText(self.tr_text('连接失败：密码错误或网络不可用', 'Connection failed: wrong password or network unavailable'))
+            self.label_wifi_status.setStyleSheet('color: #b00020; font-weight: 600;')
         self.textBrowser_log.append(str)
         # self.textBrowser_log.moveCursor(self.textBrowser_log.textCursor().End)
 
     def closeEvent(self, event):
         self.save_gui_config(
             participant_id=self.lineEdit_participant_id.text().strip(),
+            session_id=self.lineEdit_session_id.text().strip(),
             room_id=self.lineEdit_room_id.text().strip(),
             receiver_id=self.lineEdit_receiver_id.text().strip(),
-            collect_action=self.comboBox_collect_target.currentData() or 'none',
+            collection_item=self.comboBox_collect_target.currentData() or 'unknown',
+            collect_action=self.selected_collection_action(),
             collect_wait_seconds=self.timeEdit_collect_delay.value(),
             collect_duration_seconds=self.spinBox_collect_duration.value(),
             collect_number=self.spinBox_collect_number.value(),
             distance_m=round(float(self.doubleSpinBox_tx_rx_distance.value()), 2),
             language=self.language,
             complex_csi_enabled=self.checkBox_complex_csi.isChecked(),
-            calibration_role=self.comboBox_calibration_role.currentData() or 'activity',
+            calibration_role=self.selected_calibration_role(),
+            router_id=self.lineEdit_router_id.text().strip(),
+            sender_id=self.lineEdit_sender_id.text().strip(),
+            target_mac=self.lineEdit_target_mac.text().strip().lower(),
+            data_root=self._data_root_config_value(),
         )
         self.timer_boot_command.stop()
         self.serial_controller.stop()
@@ -1928,8 +2834,27 @@ class DataHandleThread(QThread):
             elif series['type'] == 'DEVICE_INFO':
                 g_device_info_series = series.copy()
                 self.signal_device_info.emit(series)
+                self.signal_log_msg.emit('__WIFI_IP__')
+            elif series['type'] == 'CSI_BATCH':
+                for row in series['data']:
+                    csi_data_handle(self, pd.Series(row))
+            elif series['type'] == 'LINK_STATUS':
+                self.signal_log_msg.emit('__LINK__:' + series['data'])
+            elif series['type'] == 'COLLECTION_REJECTED':
+                self.signal_log_msg.emit('__REJECTED__:' + series['data'])
+            elif series['type'] == 'QUALITY_RESULT':
+                self.signal_log_msg.emit('__QUALITY__:' + series['data'])
             elif series['type'] == 'CSI_DATA':
                 csi_data_handle(self, series)
+            elif series['type'] == 'SYSTEM_TELEMETRY':
+                received = int(series.get('csi_received', 0))
+                send_mode = str(series.get('send_mode', ''))
+                null_tx = int(series.get('null_tx_count', 0))
+                null_tx_errors = int(series.get('null_tx_error_count', 0))
+                null_responses = int(series.get('null_ack_or_response_count', 0))
+                wifi_connected = int(series.get('wifi_connected', 0))
+                self.signal_log_msg.emit(
+                    f'__CSI_STATUS__:{received}:{send_mode}:{null_tx}:{null_tx_errors}:{null_responses}:{wifi_connected}')
             elif series['type'] == 'RADAR_DADA':
                 radar_data_handle(self, series)
             elif series['type'] == 'LOG_DATA' and g_display_raw_data:
@@ -1998,18 +2923,32 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
     # Wait a second to let the port initialize
     set.flushInput()
 
+    connection = ConnectionIdentity()
+    connection.set_expected_target(str((experiment_config or {}).get('target_mac', '')).lower())
+    latest_telemetry = {}
+    latest_device_info = {}
+    preview_batch = []
+    preview_dropped = 0
+    last_preview = time.monotonic()
+    last_flush = time.monotonic()
+    pending_notices = []
+    pending_capture = None
+
+    def notify_capture(series):
+        pending_notices.append(series)
+
     ledger = None
     session_data_root = Path(data_root)
     if experiment_config:
         try:
-            experiment_config = dict(experiment_config)
+            experiment_config = acquisition_defaults(experiment_config)
             experiment_config['date'] = datetime.now().strftime('%Y-%m-%d')
             session_data_root = dated_collection_root(experiment_config)
             ledger = ExperimentLedger(session_data_root, experiment_config)
             print(f"研究采集已启用：会话={experiment_config['session_id']}，目录={session_data_root}")
         except Exception as e:
             data_series = pd.Series(index=['type', 'data'], data=['FAIL_EVENT', f'Invalid experiment config: {e}'])
-            queue_read.put(data_series)
+            offer_preview(queue_read, data_series)
             set.close()
             return
     else:
@@ -2051,7 +2990,8 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
     current_collect_duration_ms = None
 
     def close_target_recording(status='complete'):
-        nonlocal csi_target_data_file_fd, taget_data_writer
+        nonlocal csi_target_data_file_fd, taget_data_writer, pending_capture
+        pending_capture = None
         if csi_target_data_file_fd is not None:
             csi_target_data_file_fd.flush()
             os.fsync(csi_target_data_file_fd.fileno())
@@ -2062,6 +3002,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
             result = ledger.finish(status=status)
             if result:
                 print(f"recording finalized: {result['recording_id']}, frames={result['frame_count']}, gaps={result['sequence_gap_count']}")
+                notify_capture(pd.Series({'type': 'QUALITY_RESULT', 'data': json.dumps(result)}))
 
     resources_closed = False
 
@@ -2086,6 +3027,42 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
     time.sleep(0.01)
 
     while True:
+        now = time.monotonic()
+        while pending_notices and offer_preview(queue_read, pending_notices[0]):
+            pending_notices.pop(0)
+        if pending_capture and now > pending_capture['deadline'] and ledger and ledger.active is None:
+            missed = pending_capture
+            pending_capture = None
+            failed_path = session_data_root / ('no_frames_' + datetime.now().strftime('%H-%M-%S-%f') + '.csv')
+            failed_path.write_text(','.join(CSI_DATA_COLUMNS_NAMES) + '\n', encoding='utf-8')
+            ledger.config.update(connected_ap_bssid=connection.bssid, connected_ap_ssid=connection.ssid, raw_stream_path=str((log_folder / 'csi_data.csv').resolve()))
+            try:
+                ledger.begin(failed_path, missed['action'], 'no-frames', missed['duration'])
+                ledger.active.acquisition_errors.add('no_frames_received_after_start')
+                close_target_recording(status='incomplete')
+            except RuntimeError as exc:
+                notify_capture(pd.Series({'type': 'LOG_DATA', 'tag': 'E', 'timestamp': '', 'data': str(exc)}))
+            notify_capture(pd.Series({'type': 'COLLECTION_REJECTED', 'data': '开始后未收到动作数据，已记录失败，请补采。'}))
+            set.write(b'radar --collect_tagets unknown --collect_number 0\r\n')
+        if now - last_flush >= 0.25:
+            for fd in data_valid_list['file_fd']:
+                fd.flush()
+            if csi_target_data_file_fd is not None:
+                csi_target_data_file_fd.flush()
+            log_data_writer.flush()
+            last_flush = now
+        if preview_batch and now - last_preview >= 0.1:
+            if not offer_preview(queue_read, pd.Series({'type': 'CSI_BATCH', 'data': preview_batch})):
+                preview_dropped += len(preview_batch)
+            preview_batch = []
+            last_preview = now
+        if ledger and ledger.active and ledger.active.configured_duration_ms:
+            if (datetime.now().astimezone() - ledger.active.started_at).total_seconds() > ledger.active.configured_duration_ms / 1000 + 2:
+                ledger.active.acquisition_errors.add('recording_end_timeout')
+                notify_capture(pd.Series({'type': 'COLLECTION_REJECTED', 'data': '采集数据超时，已保留不完整数据，请补采。'}))
+                close_target_recording(status='incomplete')
+                set.write(b'radar --collect_tagets unknown --collect_number 0\r\n')
+                taget_last = 'unknown'
         try:
             command = queue_write.get_nowait()
         except Empty:
@@ -2097,10 +3074,45 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                 close_serial_resources(recording_status='aborted')
                 return
 
+            if isinstance(command, dict) and command.get('type') == 'activate_experiment':
+                if ledger is not None and ledger.active is not None:
+                    offer_preview(queue_read, pd.Series(
+                        index=['type', 'tag', 'timestamp', 'data'],
+                        data=['LOG_DATA', 'E', '实验配置', 'trial 进行中，不能切换 session。']
+                    ))
+                    continue
+                try:
+                    updated_config = acquisition_defaults(command.get('experiment_config') or {})
+                    updated_root_base = Path(command.get('data_root') or data_root)
+                    updated_config['date'] = datetime.now().strftime('%Y-%m-%d')
+                    room_id = str(updated_config.get('room_id', '')).strip()
+                    updated_root = updated_root_base / room_id / updated_config['date']
+                    updated_ledger = ExperimentLedger(updated_root, updated_config)
+                except Exception as exc:
+                    ledger = None
+                    experiment_config = None
+                    notify_capture(pd.Series({'type': 'COLLECTION_REJECTED', 'data': f'实验配置未启用：{exc}'}))
+                    continue
+                data_root = str(updated_root_base)
+                experiment_config = updated_config
+                connection.set_expected_target(str(updated_config.get('target_mac', '')))
+                session_data_root = updated_root
+                ledger = updated_ledger
+                ledger.telemetry.update(latest_telemetry)
+                ledger.note_device_info(latest_device_info)
+                active_participant_id = str(updated_config.get('participant_id', '')).strip()
+                active_room_id = room_id
+                active_receiver_id = str(updated_config.get('receiver_id', '')).strip()
+                print(f"研究采集已切换：会话={updated_config.get('session_id', '')}，目录={updated_root}")
+                continue
+
             if isinstance(command, dict) and command.get('type') == 'update_collection_metadata':
                 participant_id = str(command.get('participant_id', '')).strip()
                 room_id = str(command.get('room_id', '')).strip()
                 receiver_id = str(command.get('receiver_id', '')).strip()
+                router_id = str(command.get('router_id', '')).strip()
+                sender_id = str(command.get('sender_id', '')).strip()
+                target_mac = str(command.get('target_mac', '')).strip().lower()
                 try:
                     distance_m = round(float(command.get('distance_m', 0)), 2)
                 except (TypeError, ValueError):
@@ -2114,7 +3126,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                     print(f'兼容采集标签已更新：人员={participant_id}，地点={room_id}，设备={receiver_id}，目录={session_data_root}')
                     continue
                 if ledger.active is not None:
-                    queue_read.put(pd.Series(
+                    offer_preview(queue_read, pd.Series(
                         index=['type', 'tag', 'timestamp', 'data'],
                         data=['LOG_DATA', 'E', '采集', '采集进行中，不能修改人员或地点标签。']
                     ))
@@ -2124,6 +3136,12 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                     updated_config['participant_id'] = participant_id
                     updated_config['room_id'] = room_id
                     updated_config['receiver_id'] = receiver_id
+                    updated_config['router_id'] = router_id
+                    updated_config['sender_id'] = sender_id
+                    updated_config['target_mac'] = target_mac
+                    updated_config['send_mode'] = command.get('send_mode', 'router_ping')
+                    updated_config['site_id'] = room_id
+                    updated_config['device_pair_id'] = f"{receiver_id}__{sender_id or router_id}"
                     updated_config['distance_m'] = distance_m
                     updated_config['date'] = datetime.now().strftime('%Y-%m-%d')
                     updated_root = dated_collection_root(updated_config)
@@ -2131,14 +3149,16 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                     # before metadata can be used for a new recording.
                     updated_ledger = ExperimentLedger(updated_root, updated_config)
                 except Exception as e:
-                    queue_read.put(pd.Series(
-                        index=['type', 'tag', 'timestamp', 'data'],
-                        data=['LOG_DATA', 'E', '采集标签', f'人员或地点标签更新失败：{e}']
-                    ))
+                    ledger = None
+                    experiment_config = None
+                    notify_capture(pd.Series({'type': 'COLLECTION_REJECTED', 'data': f'采集标签未生效：{e}'}))
                     continue
                 experiment_config.update(updated_config)
+                connection.set_expected_target(target_mac)
                 session_data_root = updated_root
                 ledger = updated_ledger
+                ledger.telemetry.update(latest_telemetry)
+                ledger.note_device_info(latest_device_info)
                 active_participant_id = participant_id
                 active_room_id = room_id
                 active_receiver_id = receiver_id
@@ -2147,9 +3167,9 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
 
             if isinstance(command, dict) and command.get('type') == 'update_physics_capture':
                 if ledger is not None and ledger.active is not None:
-                    queue_read.put(pd.Series(
+                    offer_preview(queue_read, pd.Series(
                         index=['type', 'tag', 'timestamp', 'data'],
-                        data=['LOG_DATA', 'E', '物理 CSI', '采集进行中，不能修改复数 CSI 或校准角色。']
+                        data=['LOG_DATA', 'E', '物理 CSI', '采集进行中，不能修改复数 CSI 或采集项目。']
                     ))
                     continue
                 enabled = bool(command.get('complex_csi_enabled', True))
@@ -2172,13 +3192,37 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                 continue
 
             collect_match = re.search(r'--collect_duration\s+(\d+)', command)
+            if collect_match and ledger is None:
+                notify_capture(pd.Series({'type': 'COLLECTION_REJECTED', 'data': '没有有效实验配置，请重新加载或新建 session。'}))
+                continue
+            if collect_match and ledger is not None:
+                error = preflight_error(ledger.config, connection.snapshot())
+                if error:
+                    notify_capture(pd.Series({'type': 'COLLECTION_REJECTED', 'data': error}))
+                    continue
+            if command.startswith(('wifi_config', 'wifi_scan', 'restart')) and '--info' not in command:
+                connection.invalidate()
+            if '--send_mode' in command:
+                connection.settled_since = time.monotonic()
+                connection.target_times.clear()
             if collect_match:
                 current_collect_duration_ms = int(collect_match.group(1))
+                action_match = re.search(
+                    r'--collect_tagets\s+(?:"([^"]*)"|(\S+))\s+--collect_duration',
+                    command)
+                if action_match:
+                    action = action_match.group(1) or action_match.group(2)
+                    pending_capture = {
+                        'action': action,
+                        'duration': current_collect_duration_ms,
+                        'deadline': time.monotonic() + current_collect_duration_ms / 1000 + 2,
+                    }
 
             command = command + '\r\n'
             set.write(command.encode('utf-8'))
             command_count += 1
-            print(f'{datetime.now()}, serial write: {command}')
+            safe_command = re.sub(r'(--password\s+)(?:"[^"]*"|\S+)', r'\1[redacted]', command)
+            print(f'{datetime.now()}, serial write: {safe_command}')
             continue
 
         try:
@@ -2202,7 +3246,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
         except Exception as e:
             data_series = pd.Series(index=['type', 'data'],
                                     data=['FAIL_EVENT', f'Failed to read serial: {e}'])
-            queue_read.put(data_series)
+            offer_preview(queue_read, data_series)
             close_serial_resources(recording_status='aborted')
             return
 
@@ -2227,7 +3271,24 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                 except StopIteration:
                     continue
 
-                if len(data) == len(data_valid_list.at[i, 'columns_names']):
+                expected_columns = data_valid_list.at[i, 'columns_names']
+                # Accept telemetry emitted by pre-counter firmware while the
+                # collector is upgraded; missing Null Data counters are zero.
+                if data_valid_list.at[i, 'type'] == 'SYSTEM_TELEMETRY':
+                    if len(data) == len(expected_columns) - 4:
+                        data.extend(['0', '0', '0', '0'])
+                    elif len(data) == len(expected_columns) - 1:
+                        # Counter-enabled firmware before wifi_connected was added.
+                        data.append('0')
+                elif data_valid_list.at[i, 'type'] == 'CSI_DATA' and len(data) == len(expected_columns) - 1:
+                    # Legacy firmware did not emit the Wi-Fi driver's rx_seq.
+                    data.insert(expected_columns.index('rx_seq'), '')
+                elif data_valid_list.at[i, 'type'] == 'DEVICE_INFO' and len(data) == len(expected_columns) - 2:
+                    # Firmware before csi-multisite-v1 did not report the
+                    # receiver STA MAC or capture-protocol identifier.
+                    data.extend(['', 'legacy'])
+
+                if len(data) == len(expected_columns):
                     # 清理 base64 数据字段（最后一个字段），移除可能的日志信息
                     if data_valid_list.at[i, 'type'] == 'CSI_DATA' and len(data) > 0:
                         data_field = data[-1]
@@ -2249,8 +3310,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                         if min_log_start < len(data_field) and min_log_start > 10:
                             data[-1] = data_field[:min_log_start]
 
-                    data_series = pd.Series(
-                        data, index=data_valid_list.at[i, 'columns_names'], dtype=object)
+                    data_series = pd.Series(data, index=expected_columns, dtype=object)
 
                     if 'timestamp' in data_series.index:
                         try:
@@ -2285,6 +3345,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                             break
 
                         data_series['data'] = csi_raw_data
+                        connection.note_csi(data_series.to_dict())
 
                         if data_series['taget'] != 'unknown':
                             if data_series['taget'] != taget_last or data_series['taget_seq'] != taget_seq_last:
@@ -2292,7 +3353,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                                 try:
                                     action_label = validate_action_label(data_series['taget'])
                                 except ValueError as e:
-                                    queue_read.put(pd.Series(index=['type', 'data'], data=['FAIL_EVENT', str(e)]))
+                                    offer_preview(queue_read, pd.Series(index=['type', 'data'], data=['FAIL_EVENT', str(e)]))
                                     close_serial_resources(recording_status='aborted')
                                     return
                                 folder = session_data_root
@@ -2318,13 +3379,27 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                                     csi_target_data_file_fd)
                                 taget_data_writer.writerow(data_series.index)
                                 if ledger is not None:
-                                    ledger.begin(csi_target_data_file_name, action_label,
-                                                 str(data_series['taget_seq']), current_collect_duration_ms)
+                                    try:
+                                        ledger.config.update(connected_ap_bssid=connection.bssid, connected_ap_ssid=connection.ssid, raw_stream_path=str((log_folder / 'csi_data.csv').resolve()))
+                                        error = preflight_error(ledger.config, connection.snapshot())
+                                        if error:
+                                            raise RuntimeError(error)
+                                        ledger.begin(csi_target_data_file_name, action_label,
+                                                     str(data_series['taget_seq']), current_collect_duration_ms)
+                                        pending_capture = None
+                                    except Exception as exc:
+                                        csi_target_data_file_fd.close()
+                                        csi_target_data_file_fd = None
+                                        taget_data_writer = None
+                                        notify_capture(pd.Series({'type': 'COLLECTION_REJECTED', 'data': str(exc)}))
+                                        data_valid_list.at[i, 'file_writer'].writerow(data_series.astype(str))
+                                        set.write(b'radar --collect_tagets unknown --collect_number 0\r\n')
+                                        taget_last = 'unknown'
+                                        continue
 
-                            taget_data_writer.writerow(
-                                data_series.astype(str))
-                            if ledger is not None:
-                                ledger.add_csi(data_series.to_dict(), host_received_ns, time.monotonic_ns())
+                            accepted = ledger.add_csi(data_series.to_dict(), host_received_ns, time.monotonic_ns()) if ledger else True
+                            if accepted:
+                                taget_data_writer.writerow(data_series.astype(str))
 
                         elif taget_last != 'unknown':
                             close_target_recording(status='complete')
@@ -2332,26 +3407,36 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
                         taget_last = data_series['taget']
                         taget_seq_last = data_series['taget_seq']
 
-                        if queue_read.full():
-                            # print('============== queue_full ==========')
-                            pass
-                        else:
-                            # print("data_series", len(data_series), type(data_series), data_series)
-                            queue_read.put(data_series)
+                        expected_mac = connection.source_mac
+                        if ((connection.connected or connection.mode == 'espnow_research') and
+                                str(data_series['mac']).lower() == expected_mac):
+                            preview_batch.append(data_series.to_dict())
                     elif data_series['type'] == 'SYSTEM_TELEMETRY':
+                        latest_telemetry = data_series.to_dict()
+                        connection.note_telemetry(latest_telemetry)
+                        link_status = connection.snapshot()
+                        link_status['preview_dropped_frames'] = preview_dropped
+                        offer_preview(queue_read, pd.Series({'type': 'LINK_STATUS', 'data': json.dumps(link_status)}))
                         if ledger is not None:
                             ledger.note_telemetry(data_series.to_dict())
-                        queue_read.put(data_series)
+                        offer_preview(queue_read, data_series)
                     else:
-                        if data_series['type'] == 'DEVICE_INFO' and ledger is not None:
-                            ledger.note_device_info(data_series.to_dict())
-                        queue_read.put(data_series)
+                        if data_series['type'] == 'DEVICE_INFO':
+                            latest_device_info = data_series.to_dict()
+                            if ledger is not None:
+                                ledger.note_device_info(latest_device_info)
+                        offer_preview(queue_read, data_series)
 
                     data_valid_list.at[i, 'file_writer'].writerow(data_series.astype(str))
-                    data_valid_list.at[i, 'file_fd'].flush()
+                    # Periodic flush above; finalization flushes and fsyncs each trial.
                     break
         else:
-            strings = re.sub(r'\\x1b.*?m', '', strings)
+            connection.note_log(strings)
+            if (ledger and ledger.active and ledger.config.get('send_mode') != 'espnow_research'
+                    and connection.bssid != ledger.config.get('target_mac')):
+                ledger.active.acquisition_errors.add('connected_ap_changed_or_disconnected')
+            strings = re.sub(r'\x1b\[[0-9;]*m', '', strings)
+            strings = re.sub(r'(--password\s+)(?:"[^"]*"|\S+)', r'\1[redacted]', strings)
             log_data_writer.writelines(strings + '\n')
 
             log = re.match(r'.*([DIWE]) \((\d+)\) (.*)', strings, re.I)
@@ -2362,7 +3447,7 @@ def serial_handle(queue_read, queue_write, port, experiment_config=None, data_ro
             data_series = pd.Series(index=['type', 'tag', 'timestamp', 'data'],
                                     data=['LOG_DATA', log.group(1), log.group(2), log.group(3)])
             if not queue_read.full():
-                queue_read.put(data_series)
+                offer_preview(queue_read, data_series)
 
 
 def quit(signum, frame):
